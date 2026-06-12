@@ -119,6 +119,87 @@ class SparseDepthLoss:
         sparse_depth = sparse_depth.squeeze(1)
         return torch.nn.functional.smooth_l1_loss(rend_sparse_depth, sparse_depth)
 
+import torch
+import torch.nn.functional as F
+
+class DepthAnythingv2RankingLoss:
+    def __init__(self, iter_from, iter_end, end_mult,
+                 patch_size=7, margin=0.01, lambda_continuity=0.05,
+                 n_pairs=64):
+        self.iter_from = iter_from
+        self.iter_end = iter_end
+        self.end_mult = end_mult
+        self.patch_size = patch_size
+        self.margin = margin
+        self.lambda_continuity = lambda_continuity
+        self.n_pairs = n_pairs  # muestreo aleatorio más eficiente
+
+    def is_active(self, iteration):
+        return self.iter_from <= iteration <= self.iter_end
+
+    def __call__(self, cam, render_pkg, iteration):
+        if not self.is_active(iteration):
+            return torch.tensor(0.0, device='cuda')
+
+        # Usar mediana — más estable que media para ranking
+        depth = render_pkg['raw_depth'][[2]][None].clamp_min(cam.near)  # [1,1,H,W]
+        alpha = (1 - render_pkg['raw_T']).unsqueeze(0)  # [1,1,H,W]
+
+        mono_raw = cam.depthanythingv2.cuda()
+        if mono_raw.dim() == 2:
+            mono = mono_raw[None, None]
+        elif mono_raw.dim() == 3:
+            mono = mono_raw[None]
+        else:
+            mono = mono_raw
+
+        if depth.shape[-2:] != mono.shape[-2:]:
+            mono = F.interpolate(mono, size=depth.shape[-2:],
+                                 mode='bilinear', align_corners=False)
+
+        H, W = depth.shape[-2:]
+        k = self.patch_size
+        pad = k // 2
+
+        depth_u   = F.unfold(depth,       kernel_size=k, padding=pad)  # [1, k*k, L]
+        mono_u    = F.unfold(mono,         kernel_size=k, padding=pad)
+        alpha_u   = F.unfold(alpha.float(), kernel_size=k, padding=pad)
+
+        center = (k * k) // 2
+        d_c = depth_u[:, center:center+1, :]  # [1, 1, L]
+        m_c = mono_u[:, center:center+1, :]
+
+        # Diferencias respecto al centro
+        d_diff = depth_u - d_c  # positivo = vecino más lejos (métrica)
+        m_diff = mono_u - m_c   # positivo = vecino mayor disparity = más CERCA
+
+        # CORRECCIÓN: mayor disparity mono → más cercano → d_diff debe ser negativo
+        # Penalizar cuando sign(d_diff) == sign(m_diff) (violación de ranking)
+        ranking_loss = torch.clamp(self.margin + torch.sign(m_diff) * d_diff, min=0.0)
+
+        # Máscara: centro válido + vecino válido
+        valid = (alpha_u[:, center:center+1, :] > 0.5) & \
+                (alpha_u > 0.5).all(dim=1, keepdim=True)
+
+        # Continuity: solo en regiones planas (std mono pequeña)
+        m_std = mono_u.std(dim=1, keepdim=True).clamp_min(1e-6)
+        flat_region = (m_std < m_std.mean() * 0.5).float()
+
+        # Normalizar y comparar gradientes locales
+        d_std = d_diff.std(dim=1, keepdim=True).clamp_min(1e-4)
+        continuity_loss = (d_diff / d_std - m_diff / m_std).abs()
+
+        loss = (ranking_loss * valid).sum() / (valid.sum().clamp_min(1)) + \
+               self.lambda_continuity * \
+               (continuity_loss * flat_region * valid).sum() / (valid.sum().clamp_min(1))
+
+        # Annealing suave
+        ratio = (iteration - self.iter_from) / max(self.iter_end - self.iter_from, 1)
+        mult = self.end_mult ** ratio
+        if iteration % 1000 == 0:
+            print(f"Depth ranking loss multiplier: {mult}")
+            print(f"Depth ranking loss: {loss}")
+        return mult * loss
 
 class DepthAnythingv2Loss:
     def __init__(self, iter_from, iter_end, end_mult):

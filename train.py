@@ -55,7 +55,8 @@ def training(args):
             cam.auto_exposure_init()
 
     # Prepare monocular depth priors if instructed
-    if cfg.regularizer.lambda_depthanythingv2:
+    if cfg.regularizer.lambda_depthanythingv2 or cfg.regularizer.lambda_depth_ranking > 0:
+    #if cfg.regularizer.lambda_depthanythingv2:
         mono_utils.prepare_depthanythingv2(
             cameras=tr_cams,
             source_path=cfg.data.source_path,
@@ -85,7 +86,7 @@ def training(args):
         white_background=cfg.model.white_background,
         black_background=cfg.model.black_background,
     )
-
+    # Load checkpoint if specified, preview progress
     if args.load_iteration:
         loaded_iter = voxel_model.load_iteration(
             args.model_path, args.load_iteration)
@@ -164,6 +165,15 @@ def training(args):
     nmed_loss = loss_utils.NormalMedianConsistencyLoss(
         iter_from=cfg.regularizer.n_dmed_from,
         iter_end=cfg.regularizer.n_dmed_end)
+    
+    # New
+    depth_ranking_loss = loss_utils.DepthAnythingv2RankingLoss(
+        iter_from=cfg.regularizer.depth_ranking_from,
+        iter_end=cfg.regularizer.depth_ranking_end,
+        end_mult=cfg.regularizer.depth_ranking_end_mult,
+        patch_size=cfg.regularizer.depth_ranking_patch_size,
+    )
+    
 
     ema_loss_for_log = 0.0
     ema_psnr_for_log = 0.0
@@ -185,22 +195,26 @@ def training(args):
             voxel_model.reset_sh_from_cameras(tr_cams)
             torch.cuda.empty_cache()
 
-        # Use default super-sampling option
+        # Use default super-sampling option ////////// RESOLUCIONNNNNNNNNNNNNNNNNN 
         if iteration > 1000:
             if cfg.regularizer.ss_aug_max > 1:
                 tr_render_opt['ss'] = np.random.uniform(1, cfg.regularizer.ss_aug_max)
             elif 'ss' in tr_render_opt:
                 tr_render_opt.pop('ss')  # Use default ss
 
+        
+        need_depth_ranking = (cfg.regularizer.lambda_depth_ranking > 0 and depth_ranking_loss.is_active(iteration))
+
         need_sparse_depth = cfg.regularizer.lambda_sparse_depth > 0 and sparse_depth_loss.is_active(iteration)
         need_depthanythingv2 = cfg.regularizer.lambda_depthanythingv2 > 0 and depthanythingv2_loss.is_active(iteration)
         need_mast3r_metric_depth = cfg.regularizer.lambda_mast3r_metric_depth > 0 and mast3r_metric_depth_loss.is_active(iteration)
         need_nd_loss = cfg.regularizer.lambda_normal_dmean > 0 and nd_loss.is_active(iteration)
         need_nmed_loss = cfg.regularizer.lambda_normal_dmed > 0 and nmed_loss.is_active(iteration)
-        tr_render_opt['output_T'] = cfg.regularizer.lambda_T_concen > 0 or cfg.regularizer.lambda_T_inside > 0 or cfg.regularizer.lambda_mask > 0 or need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth
+        tr_render_opt['output_T'] = cfg.regularizer.lambda_T_concen > 0 or cfg.regularizer.lambda_T_inside > 0 or cfg.regularizer.lambda_mask > 0 or need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_depth_ranking
+        #tr_render_opt['output_T'] = cfg.regularizer.lambda_T_concen > 0 or cfg.regularizer.lambda_T_inside > 0 or cfg.regularizer.lambda_mask > 0 or need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth
         tr_render_opt['output_normal'] = need_nd_loss or need_nmed_loss
-        tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth
-
+        tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth or need_depth_ranking
+        #tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth
         if iteration >= cfg.regularizer.dist_from and cfg.regularizer.lambda_dist:
             tr_render_opt['lambda_dist'] = cfg.regularizer.lambda_dist
 
@@ -250,6 +264,17 @@ def training(args):
         if need_mast3r_metric_depth:
             loss += cfg.regularizer.lambda_mast3r_metric_depth * mast3r_metric_depth_loss(cam, render_pkg, iteration)
 
+        # Depth ranking loss .....
+        
+        if need_depth_ranking:
+            loss += cfg.regularizer.lambda_depth_ranking * depth_ranking_loss(cam, render_pkg, iteration)
+        if iteration == self.iter_from + 10:
+            with torch.no_grad():
+                print(f"Depth range: {depth.min():.3f} - {depth.max():.3f}")
+                print(f"Mono range:  {mono.min():.3f} - {mono.max():.3f}")  
+                print(f"Ranking loss (raw): {ranking_loss.item():.4f}")
+                print(f"Photometric loss:   {photo_loss.item():.4f}")
+    
         if cfg.regularizer.lambda_ssim:
             loss += cfg.regularizer.lambda_ssim * loss_utils.fast_ssim_loss(render_image, gt_image)
         if cfg.regularizer.lambda_T_concen:

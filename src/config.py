@@ -128,6 +128,12 @@ cfg.regularizer = CfgNode(dict(
     # Data augmentation
     ss_aug_max = 1.5,
     rand_bg = False,
+    #NUEVO
+    lambda_depth_ranking=0.0,
+    depth_ranking_from=3000,
+    depth_ranking_end=20000,
+    depth_ranking_end_mult=0.1,
+    depth_ranking_patch_size=11,
 ))
 
 cfg.init = CfgNode(dict(

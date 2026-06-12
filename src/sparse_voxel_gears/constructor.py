@@ -20,7 +20,7 @@ class SVConstructor:
                    outside_level,      # Number of Octree levels for background
                    init_n_level=6,     # Starting from (2^init_n_level)^3 voxels
                    init_out_ratio=2.0, # Number of voxel ratio for outside (background region)
-                   sh_degree_init=3,   # Initial activated sh degree
+                   sh_degree_init=1,   # Initial activated sh degree //
                    geo_init=-10.0,     # Init pre-activation density
                    sh0_init=0.5,       # Init voxel colors in range [0,1]
                    shs_init=0.0,       # Init coefficients of higher-degree sh

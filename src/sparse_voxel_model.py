@@ -18,7 +18,7 @@ class SparseVoxelModel(SVConstructor, SVProperties, SVRenderer, SVAdaptive, SVIn
 
     def __init__(self,
                  n_samp_per_vox=1,       # Number of sampled points per visited voxel
-                 sh_degree=3,            # Use 3 * (k+1)^2 params per voxels for view-dependent colors
+                 sh_degree=1,            # Use 3 * (k+1)^2 params per voxels for view-dependent colors
                  ss=1.5,                 # Super-sampling rates for anti-aliasing
                  white_background=False, # Assum white background
                  black_background=False, # Assum black background
