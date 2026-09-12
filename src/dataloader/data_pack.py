@@ -171,7 +171,8 @@ class CameraCreator:
                  cy_p=0.5,
                  sparse_pt=None,
                  image_name="",
-                 mask=None):
+                 mask=None,
+                 c2w_gt=None):
 
         # Determine target resolution
         if self.res_downscale > 0:
@@ -229,4 +230,5 @@ class CameraCreator:
             image=tensor,
             mask=mask,
             sparse_pt=sparse_pt,
-            image_name=image_name)
+            image_name=image_name,
+            c2w_gt=c2w_gt)

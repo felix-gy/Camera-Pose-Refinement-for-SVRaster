@@ -66,7 +66,8 @@ renderCUDA(
     const float* out_D,
     const float* out_N,
 
-    float* dL_dvox)
+    float* dL_dvox,
+    float* __restrict__ dL_dc2w)
 {
     // We rasterize again. Compute necessary block info.
     auto block = cg::this_thread_block();
@@ -212,6 +213,10 @@ renderCUDA(
 
     // For seam regularizaiton.
     int j_lst[BLOCK_SIZE];
+
+    // For camera pose gradients.
+    float3 dL_dro = {0.f, 0.f, 0.f};
+    float3 dL_drd = {0.f, 0.f, 0.f};
 
     // Traverse all voxels.
     for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -418,10 +423,10 @@ renderCUDA(
                 dL_dgeo_params[iii] += dL_dI * dI_dgeo_params[iii];
 
             // Gradient from depth
+            float dLdepth_dI[3] = {0.f, 0.f, 0.f};
             if (need_depth)
             {
                 float dval;
-                float dLdepth_dI[n_samp];
                 if (n_samp == 3)
                 {
                     float step_sz = 0.3333333f * (b - a);
@@ -470,6 +475,39 @@ renderCUDA(
                 {
                     for (int iii=0; iii<8; ++iii)
                         dL_dgeo_params[iii] += dLdepth_dI[0] * dI_dgeo_params[iii];
+                }
+            }
+
+            if (dL_dc2w != nullptr)
+            {
+                float3 cur_qt = (ro + (a + 0.5f * step_sz) * rd - (vox_c - 0.5f * vox_l)) * vox_l_inv;
+                for (int k=0; k<n_samp; k++, cur_qt = cur_qt + qt_step)
+                {
+                    float interp_w_k[8];
+                    tri_interp_weight(cur_qt, interp_w_k);
+                    float d_val = 0.f;
+                    for (int iii=0; iii<8; ++iii)
+                        d_val += geo_params[iii] * interp_w_k[iii];
+                    float dd_dd_k = STEP_SZ_SCALE * step_sz * exp_linear_11_bw(d_val);
+                    float3 grad_qt = tri_interp_grad(cur_qt, geo_params);
+                    float3 grad_pt = (dd_dd_k * vox_l_inv) * grad_qt;
+
+                    float eff_dI = dL_dI;
+                    if (need_depth)
+                    {
+                        if (n_samp == 3)
+                            eff_dI += dLdepth_dI[k];
+                        else if (n_samp == 2)
+                            eff_dI += dLdepth_dI[k];
+                        else
+                            eff_dI += dLdepth_dI[0];
+                    }
+
+                    float3 dL_dpt = eff_dI * grad_pt;
+                    float s_k = a + (k + 0.5f) * step_sz;
+
+                    dL_dro = dL_dro + dL_dpt;
+                    dL_drd = dL_drd + (s_k * dL_dpt);
                 }
             }
 
@@ -526,6 +564,45 @@ renderCUDA(
             for (int iii=0; iii<12; ++iii)
                 atomicAdd(dL_dvox + vox_id * 12 + (base_id+iii)%12, grad_pack[(base_id+iii)%12]);
         }
+    }
+
+    if (dL_dc2w != nullptr)
+    {
+        float pix_c2w_grad[12] = {0.f};
+        if (inside)
+        {
+            const float3 v_hat = cam_rd * rd_norm_inv;
+            // Row 0
+            pix_c2w_grad[0]  = dL_drd.x * v_hat.x;
+            pix_c2w_grad[1]  = dL_drd.x * v_hat.y;
+            pix_c2w_grad[2]  = dL_drd.x * v_hat.z;
+            pix_c2w_grad[3]  = dL_dro.x;
+            // Row 1
+            pix_c2w_grad[4]  = dL_drd.y * v_hat.x;
+            pix_c2w_grad[5]  = dL_drd.y * v_hat.y;
+            pix_c2w_grad[6]  = dL_drd.y * v_hat.z;
+            pix_c2w_grad[7]  = dL_dro.y;
+            // Row 2
+            pix_c2w_grad[8]  = dL_drd.z * v_hat.x;
+            pix_c2w_grad[9]  = dL_drd.z * v_hat.y;
+            pix_c2w_grad[10] = dL_drd.z * v_hat.z;
+            pix_c2w_grad[11] = dL_dro.z;
+        }
+
+        __shared__ float s_block_c2w[12];
+        if (thread_id < 12)
+            s_block_c2w[thread_id] = 0.f;
+        block.sync();
+
+        if (inside)
+        {
+            for (int m = 0; m < 12; ++m)
+                atomicAdd(&s_block_c2w[m], pix_c2w_grad[m]);
+        }
+        block.sync();
+
+        if (thread_id < 12)
+            atomicAdd(dL_dc2w + thread_id, s_block_c2w[thread_id]);
     }
 }
 
@@ -603,7 +680,8 @@ void render(
     const float* out_D,
     const float* out_N,
 
-    float* dL_dvox)
+    float* dL_dvox,
+    float* dL_dc2w)
 {
     const bool need_distortion = (lambda_dist > 0);
 
@@ -646,12 +724,13 @@ void render(
         out_D,
         out_N,
 
-        dL_dvox);
+        dL_dvox,
+        dL_dc2w);
 }
 
 
 // Interface for python to run backward pass of voxel rasterization.
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels_backward(
     const int R,
     const int n_samp_per_vox,
@@ -699,10 +778,12 @@ rasterize_voxels_backward(
         torch::Tensor dL_dgeos = torch::empty({0});
         torch::Tensor dL_drgbs = torch::empty({0});
         torch::Tensor subdiv_p_bw = torch::empty({0});
-        return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw);
+        torch::Tensor dL_dc2w = torch::zeros({4, 4}, vox_centers.options());
+        return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw, dL_dc2w);
     }
 
     torch::Tensor dL_dvox = torch::zeros({P, geos.size(1)+3+1}, vox_centers.options());
+    torch::Tensor dL_dc2w = torch::zeros({4, 4}, vox_centers.options());
     dim3 tile_grid((image_width + BLOCK_X - 1) / BLOCK_X, (image_height + BLOCK_Y - 1) / BLOCK_Y, 1);
     dim3 block(BLOCK_X, BLOCK_Y, 1);
 
@@ -757,7 +838,8 @@ rasterize_voxels_backward(
         out_D.contiguous().data_ptr<float>(),
         out_N.contiguous().data_ptr<float>(),
 
-        dL_dvox.contiguous().data_ptr<float>());
+        dL_dvox.contiguous().data_ptr<float>(),
+        dL_dc2w.contiguous().data_ptr<float>());
     CHECK_CUDA(debug);
 
     std::vector<torch::Tensor> gradient_lst = dL_dvox.split({geos.size(1), 3, 1}, 1);
@@ -765,7 +847,7 @@ rasterize_voxels_backward(
     torch::Tensor dL_drgbs = gradient_lst[1].contiguous();
     torch::Tensor subdiv_p_bw = gradient_lst[2].contiguous();
 
-    return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw);
+    return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw, dL_dc2w);
 }
 
 }

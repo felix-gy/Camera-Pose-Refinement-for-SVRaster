@@ -1,0 +1,11 @@
+# Camera Pose Optimization Configuration for SVRaster
+# Optimizes 6 DoF camera poses jointly with sparse voxels.
+
+pose_opt:
+  pose_opt: True
+  pose_init_mode: "colmap"      # Options: "colmap" | "identity"
+  lr_pose: 0.001
+  lr_pose_end: 0.00001
+  warmup_pose: 1000             # Warmup iterations before refining poses
+  eval_pose_gt: True            # Evaluate ATE/RPE against GT poses if available
+  pose_epoch_interval: 1        # Epoch interval for recording CSV/JSONL metrics

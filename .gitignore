@@ -20,3 +20,35 @@ data
 datas
 
 
+data/
+results/
+notebooks/
+
+
+# Compilados y Python
+build/
+*.so
+__pycache__/
+*.egg-info/
+*.egg
+eggs/
+.eggs/
+.ipynb_checkpoints/
+
+# Editores de código (como PyCharm o VS Code)
+.idea/
+.vscode/
+
+# Archivos de registro (Logs)
+*.log
+log/
+logs/
+
+# Carpetas de datos y resultados (Ignoradas por completo)
+data/
+datas/
+ckpt/
+ckpts/
+output/
+outputs/
+results/

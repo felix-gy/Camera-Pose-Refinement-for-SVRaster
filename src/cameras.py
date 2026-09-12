@@ -10,6 +10,7 @@ import numpy as np
 
 import torch
 import svraster_cuda
+from src.utils.camera_utils import se3_to_SE3
 
 
 class CameraBase:
@@ -122,13 +123,16 @@ class Camera(CameraBase):
             w2c, fovx, fovy, cx_p, cy_p,
             near=0.02,
             image=None, mask=None, depth=None,
-            sparse_pt=None):
+            sparse_pt=None,
+            c2w_gt=None):
 
         self.image_name = image_name
 
         # Camera parameters
-        self.w2c = torch.tensor(w2c, dtype=torch.float32, device="cuda")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.w2c = torch.as_tensor(w2c, dtype=torch.float32, device=device)
         self.c2w = self.w2c.inverse().contiguous()
+        self.c2w_gt = torch.as_tensor(c2w_gt, dtype=torch.float32, device=device) if c2w_gt is not None else None
 
         self.fovx = fovx
         self.fovy = fovy
@@ -285,3 +289,72 @@ class MiniCam(CameraBase):
             [0, 0, 1],
         ], dtype=torch.float32, device="cuda")
         return self.rotate(R)
+
+
+class CameraPoseOptimizer(torch.nn.Module):
+    def __init__(self, num_cams: int, init_c2w_list=None, mode: str = "colmap", device=None):
+        """
+        Camera pose refinement module using se(3) Lie algebra parametrization.
+        Optimizes a 6 DoF residual per camera: c2w_opt = c2w_base @ exp(se3_refine).
+
+        Args:
+            num_cams: Total number of training cameras.
+            init_c2w_list: List of Camera objects or tensor of [N, 4, 4] initial c2w matrices.
+            mode: 'colmap' (refine relative to provided initial poses)
+                  'identity' (initialize all cameras at world origin I_4x4)
+            device: Target device ('cuda', 'cpu', etc.). Defaults to cuda if available.
+        """
+        super().__init__()
+        self.num_cams = num_cams
+        self.mode = mode
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Learnable 6 DoF se(3) tangent vectors per camera, initialized to zeros (exp(0) = I)
+        self.se3_refine = torch.nn.Embedding(num_cams, 6, device=device)
+        torch.nn.init.zeros_(self.se3_refine.weight)
+
+        # Store fixed base poses
+        if mode == "colmap" and init_c2w_list is not None:
+            if hasattr(init_c2w_list[0], 'c2w'):
+                base_poses = torch.stack([cam.c2w.detach().clone().float().to(device) for cam in init_c2w_list])
+            else:
+                base_poses = torch.stack([torch.as_tensor(p, dtype=torch.float32, device=device) for p in init_c2w_list])
+        else:
+            # Identity initialization: all cameras start at world origin I_4x4
+            base_poses = torch.eye(4, dtype=torch.float32, device=device).unsqueeze(0).repeat(num_cams, 1, 1)
+
+        self.register_buffer("base_c2w", base_poses)
+
+    def get_c2w(self, cam_idx):
+        """
+        Computes the optimized camera-to-world (c2w) matrix for a given camera index:
+        c2w_opt = c2w_base @ exp(se3_refine)
+        """
+        if not torch.is_tensor(cam_idx):
+            cam_idx = torch.tensor(cam_idx, dtype=torch.long, device=self.base_c2w.device)
+        elif cam_idx.device != self.base_c2w.device:
+            cam_idx = cam_idx.to(self.base_c2w.device)
+
+        delta_T = se3_to_SE3(self.se3_refine(cam_idx))
+        c2w_opt = self.base_c2w[cam_idx] @ delta_T
+        return c2w_opt
+
+    def get_all_c2w(self):
+        """Returns all optimized c2w matrices [N, 4, 4]."""
+        all_indices = torch.arange(self.num_cams, device=self.base_c2w.device)
+        delta_T = se3_to_SE3(self.se3_refine(all_indices))
+        return self.base_c2w @ delta_T
+
+    def state_dict_poses(self):
+        return {
+            'se3_refine': self.se3_refine.weight.detach().cpu(),
+            'base_c2w': self.base_c2w.detach().cpu(),
+            'mode': self.mode,
+        }
+
+    def load_state_dict_poses(self, state):
+        self.se3_refine.weight.data.copy_(state['se3_refine'].to(self.se3_refine.weight.device))
+        if 'base_c2w' in state:
+            self.base_c2w.copy_(state['base_c2w'].to(self.base_c2w.device))

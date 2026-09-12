@@ -320,6 +320,27 @@ __forceinline__ __device__ float tri_interp_weight(const float3 qt, float interp
     interp_w[7] = wx[1] * wy[1] * wz[1];
 }
 
+__forceinline__ __device__ float3 tri_interp_grad(const float3 qt, const float geo_params[8])
+{
+    const float wx[2] = {1.f - qt.x, qt.x};
+    const float wy[2] = {1.f - qt.y, qt.y};
+    const float wz[2] = {1.f - qt.z, qt.z};
+
+    const float d_dx = 
+        - (geo_params[0]*wy[0]*wz[0] + geo_params[1]*wy[0]*wz[1] + geo_params[2]*wy[1]*wz[0] + geo_params[3]*wy[1]*wz[1])
+        + (geo_params[4]*wy[0]*wz[0] + geo_params[5]*wy[0]*wz[1] + geo_params[6]*wy[1]*wz[0] + geo_params[7]*wy[1]*wz[1]);
+
+    const float d_dy = 
+        - (geo_params[0]*wx[0]*wz[0] + geo_params[1]*wx[0]*wz[1] + geo_params[4]*wx[1]*wz[0] + geo_params[5]*wx[1]*wz[1])
+        + (geo_params[2]*wx[0]*wz[0] + geo_params[3]*wx[0]*wz[1] + geo_params[6]*wx[1]*wz[0] + geo_params[7]*wx[1]*wz[1]);
+
+    const float d_dz = 
+        - (geo_params[0]*wx[0]*wy[0] + geo_params[2]*wx[0]*wy[1] + geo_params[4]*wx[1]*wy[0] + geo_params[6]*wx[1]*wy[1])
+        + (geo_params[1]*wx[0]*wy[0] + geo_params[3]*wx[0]*wy[1] + geo_params[5]*wx[1]*wy[0] + geo_params[7]*wx[1]*wy[1]);
+
+    return make_float3(d_dx, d_dy, d_dz);
+}
+
 // Debugging helper.
 #define CHECK_CUDA(debug) \
 if(debug) { \

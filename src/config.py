@@ -182,6 +182,16 @@ cfg.auto_exposure = CfgNode(dict(
     auto_exposure_upd_ckpt = [5000, 10000, 15000]
 ))
 
+cfg.pose_opt = CfgNode(dict(
+    pose_opt = False,
+    pose_init_mode = "colmap",        # "colmap" | "identity"
+    lr_pose = 1e-3,
+    lr_pose_end = 1e-5,
+    warmup_pose = 1000,
+    eval_pose_gt = True,
+    pose_epoch_interval = 1,
+))
+
 for i_cfg in cfg.values():
     i_cfg.set_new_allowed(True)
 

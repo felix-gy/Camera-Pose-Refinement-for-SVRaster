@@ -1,0 +1,7 @@
+hay alguna diferncia si ejecuto esto antes y ahora?
+python train.py --eval --source_path data/Horse --model_path results/Horse_10k --lambda_T_inside 0.01 --lambda_normal_dmean 0.001 --lambda_normal_dmed 0.001 --lambda_sparse_depth 0.01 --n_iter 10000
+
+y ahora con esto hay difrencia?
+
+python train.py --eval --source_path data/Horse --model_path results/Horse_10k --lambda_T_inside 0.01 --lambda_normal_dmean 0.001 --lambda_normal_dmed 0.001 --lambda_sparse_depth 0.01 --n_iter 10000 --pose_opt --pose_init_mode colmap --lr_pose 0.001 --warmup_pose 500
+

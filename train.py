@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 import torch
 
-from src.config import cfg, update_argparser, update_config
+from src.config import cfg, update_argparser, update_config, everytype2bool
 
 from src.utils.system_utils import seed_everything
 from src.utils.image_utils import im_tensor2np, viz_tensordepth
@@ -27,6 +27,8 @@ from src.utils import loss_utils
 
 from src.dataloader.data_pack import DataPack, compute_iter_idx
 from src.sparse_voxel_model import SparseVoxelModel
+from src.cameras import CameraPoseOptimizer
+from src.utils.camera_utils import compute_ate, compute_rpe
 
 import svraster_cuda
 
@@ -132,10 +134,46 @@ def training(args):
         scheduler.load_state_dict(optim_ckpt['sched'])
         del optim_ckpt
 
+    # Camera Pose Optimizer initialization
+    pose_optimizer = None
+    optim_pose = None
+    sched_pose = None
+    if cfg.pose_opt.pose_opt:
+        print(f"[POSE OPT] Initializing CameraPoseOptimizer with {len(tr_cams)} cameras (mode='{cfg.pose_opt.pose_init_mode}', lr={cfg.pose_opt.lr_pose}, warmup={cfg.pose_opt.warmup_pose})")
+        pose_optimizer = CameraPoseOptimizer(
+            num_cams=len(tr_cams),
+            init_c2w_list=tr_cams,
+            mode=cfg.pose_opt.pose_init_mode
+        ).cuda()
+        optim_pose = torch.optim.Adam(
+            pose_optimizer.parameters(),
+            lr=cfg.pose_opt.lr_pose
+        )
+        total_decay_steps = max(1, cfg.procedure.n_iter - cfg.pose_opt.warmup_pose)
+        gamma = (cfg.pose_opt.lr_pose_end / cfg.pose_opt.lr_pose) ** (1.0 / total_decay_steps)
+        sched_pose = torch.optim.lr_scheduler.ExponentialLR(optim_pose, gamma=gamma)
+
+        if loaded_iter and args.load_optimizer:
+            pose_ckpt_path = os.path.join(args.model_path, f"pose_opt_{loaded_iter:06d}.pt")
+            if not os.path.exists(pose_ckpt_path):
+                pose_ckpt_path = os.path.join(args.model_path, "pose_opt.pt")
+            if os.path.exists(pose_ckpt_path):
+                pose_ckpt = torch.load(pose_ckpt_path, map_location="cuda")
+                pose_optimizer.load_state_dict_poses(pose_ckpt['poses'])
+                if 'optim' in pose_ckpt and optim_pose is not None:
+                    optim_pose.load_state_dict(pose_ckpt['optim'])
+                if 'sched' in pose_ckpt and sched_pose is not None:
+                    sched_pose.load_state_dict(pose_ckpt['sched'])
+                print(f"[POSE OPT] Loaded pose optimizer state from {pose_ckpt_path}")
+
     # Some other initialization
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
     elapsed = 0
+    epoch_tracker = {
+        'prev_c2w': pose_optimizer.get_all_c2w().detach().clone() if pose_optimizer is not None else None,
+        'last_elapsed': 0.0
+    }
 
     tr_render_opt = {
         'track_max_w': False,
@@ -229,7 +267,12 @@ def training(args):
                 cam.auto_exposure_update(ref, cam.image.cuda())
 
         # Pick a Camera
-        cam = tr_cams[tr_cam_indices[iteration-1]]
+        cam_idx = tr_cam_indices[iteration-1]
+        cam = tr_cams[cam_idx]
+        if cfg.pose_opt.pose_opt and pose_optimizer is not None:
+            cam_c2w = pose_optimizer.get_c2w(cam_idx)
+            cam.c2w = cam_c2w
+            cam.w2c = torch.inverse(cam_c2w).detach()
 
         # Get gt image
         gt_image = cam.image.cuda()
@@ -265,16 +308,9 @@ def training(args):
             loss += cfg.regularizer.lambda_mast3r_metric_depth * mast3r_metric_depth_loss(cam, render_pkg, iteration)
 
         # Depth ranking loss .....
-        
         if need_depth_ranking:
             loss += cfg.regularizer.lambda_depth_ranking * depth_ranking_loss(cam, render_pkg, iteration)
-        if iteration == self.iter_from + 10:
-            with torch.no_grad():
-                print(f"Depth range: {depth.min():.3f} - {depth.max():.3f}")
-                print(f"Mono range:  {mono.min():.3f} - {mono.max():.3f}")  
-                print(f"Ranking loss (raw): {ranking_loss.item():.4f}")
-                print(f"Photometric loss:   {photo_loss.item():.4f}")
-    
+
         if cfg.regularizer.lambda_ssim:
             loss += cfg.regularizer.lambda_ssim * loss_utils.fast_ssim_loss(render_image, gt_image)
         if cfg.regularizer.lambda_T_concen:
@@ -288,6 +324,8 @@ def training(args):
 
         # Backward to get gradient of current iteration
         optimizer.zero_grad(set_to_none=True)
+        if optim_pose is not None:
+            optim_pose.zero_grad(set_to_none=True)
         loss.backward()
 
         # Total variation regularization
@@ -298,6 +336,8 @@ def training(args):
 
         # Optimizer step
         optimizer.step()
+        if optim_pose is not None and iteration > cfg.pose_opt.warmup_pose:
+            optim_pose.step()
 
         ######################################################
         # Start adaptive voxels pruning and subdividing
@@ -393,6 +433,8 @@ def training(args):
 
         # Update learning rate
         scheduler.step()
+        if sched_pose is not None and iteration > cfg.pose_opt.warmup_pose:
+            sched_pose.step()
 
         # End processing time tracking of this iteration
         iter_end.record()
@@ -426,7 +468,8 @@ def training(args):
                 voxel_model=voxel_model,
                 iteration=iteration,
                 elapsed=elapsed,
-                ema_psnr=ema_psnr_for_log)
+                ema_psnr=ema_psnr_for_log,
+                pose_optimizer=pose_optimizer)
 
             if iteration in args.checkpoint_iterations or iteration == cfg.procedure.n_iter:
                 voxel_model.save_iteration(args.model_path, iteration, quantize=args.save_quantized)
@@ -434,10 +477,205 @@ def training(args):
                     torch.save(
                         {'optim': optimizer.state_dict(), 'sched': scheduler.state_dict()},
                         os.path.join(args.model_path, "optim.pt"))
+                if cfg.pose_opt.pose_opt and pose_optimizer is not None:
+                    pose_ckpt = {
+                        'poses': pose_optimizer.state_dict_poses(),
+                    }
+                    if args.save_optimizer and optim_pose is not None:
+                        pose_ckpt['optim'] = optim_pose.state_dict()
+                        pose_ckpt['sched'] = sched_pose.state_dict()
+                    torch.save(pose_ckpt, os.path.join(args.model_path, f"pose_opt_{iteration:06d}.pt"))
+                    torch.save(pose_ckpt, os.path.join(args.model_path, "pose_opt.pt"))
+                    print(f"[SAVE POSE] path={os.path.join(args.model_path, f'pose_opt_{iteration:06d}.pt')}")
                 print(f"[SAVE] path={voxel_model.latest_save_path}")
 
+            # Record per-epoch metrics (structure + pose variation)
+            record_epoch_metrics(
+                args=args,
+                iteration=iteration,
+                elapsed=elapsed,
+                ema_loss=ema_loss_for_log,
+                ema_psnr=ema_psnr_for_log,
+                voxel_model=voxel_model,
+                pose_optimizer=pose_optimizer,
+                tr_cams=tr_cams,
+                optimizer=optimizer,
+                optim_pose=optim_pose,
+                epoch_tracker=epoch_tracker,
+                progress_bar=progress_bar
+            )
 
-def training_report(args, data_pack, voxel_model, iteration, elapsed, ema_psnr):
+
+def record_epoch_metrics(
+    args, iteration, elapsed, ema_loss, ema_psnr,
+    voxel_model, pose_optimizer, tr_cams,
+    optimizer, optim_pose, epoch_tracker,
+    progress_bar=None
+):
+    n_cams = max(1, len(tr_cams))
+    is_epoch_end = (iteration % n_cams == 0) or (iteration == cfg.procedure.n_iter)
+    if not is_epoch_end:
+        return
+
+    current_epoch = iteration // n_cams if (iteration % n_cams == 0) else (iteration // n_cams + 1)
+    epoch_interval = getattr(cfg.pose_opt, 'pose_epoch_interval', 1)
+    if (current_epoch % epoch_interval != 0) and (iteration != cfg.procedure.n_iter):
+        return
+
+    elapsed_sec = elapsed / 1000.0
+    epoch_time_sec = elapsed_sec - epoch_tracker.get('last_elapsed', 0.0)
+    epoch_tracker['last_elapsed'] = elapsed_sec
+
+    # 1. Structure metrics
+    num_voxels = voxel_model.num_voxels
+    try:
+        inside_mask = voxel_model.inside_mask
+        inside_voxels = inside_mask.sum().item()
+        inside_pct = (inside_voxels / max(1, num_voxels)) * 100.0
+    except Exception:
+        inside_voxels = num_voxels
+        inside_pct = 100.0
+
+    lr_geo = optimizer.param_groups[0]['lr'] if (optimizer is not None and len(optimizer.param_groups) > 0) else 0.0
+    lr_pose = optim_pose.param_groups[0]['lr'] if (optim_pose is not None and iteration > cfg.pose_opt.warmup_pose) else 0.0
+
+    # 2. Pose variation metrics
+    epoch_drot_mean_deg = 0.0
+    epoch_drot_max_deg = 0.0
+    epoch_dtrans_mean_m = 0.0
+    epoch_dtrans_max_m = 0.0
+
+    tot_drot_mean_deg = 0.0
+    tot_drot_max_deg = 0.0
+    tot_dtrans_mean_m = 0.0
+    tot_dtrans_max_m = 0.0
+
+    ate_res = None
+    rpe_res = None
+    has_gt = False
+
+    if pose_optimizer is not None:
+        curr_c2w = pose_optimizer.get_all_c2w().detach()  # [N, 4, 4]
+
+        # Pose variation in this epoch relative to previous epoch
+        if epoch_tracker.get('prev_c2w') is not None:
+            prev_c2w = epoch_tracker['prev_c2w']
+            R_rel = torch.bmm(prev_c2w[:, :3, :3].transpose(-1, -2), curr_c2w[:, :3, :3])
+            t_rel = curr_c2w[:, :3, 3] - prev_c2w[:, :3, 3]
+
+            traces = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
+            cos_ang = torch.clamp((traces - 1.0) / 2.0, -1.0, 1.0)
+            epoch_rot_deg = torch.acos(cos_ang) * (180.0 / np.pi)
+            epoch_trans_m = torch.norm(t_rel, dim=-1)
+
+            epoch_drot_mean_deg = epoch_rot_deg.mean().item()
+            epoch_drot_max_deg = epoch_rot_deg.max().item()
+            epoch_dtrans_mean_m = epoch_trans_m.mean().item()
+            epoch_dtrans_max_m = epoch_trans_m.max().item()
+
+        epoch_tracker['prev_c2w'] = curr_c2w.clone()
+
+        # Cumulative variation from initialization (COLMAP base poses)
+        se3 = pose_optimizer.se3_refine.weight.detach()
+        tot_rot_deg = se3[:, :3].norm(dim=1) * (180.0 / np.pi)
+        tot_trans_m = se3[:, 3:].norm(dim=1)
+        tot_drot_mean_deg = tot_rot_deg.mean().item()
+        tot_drot_max_deg = tot_rot_deg.max().item()
+        tot_dtrans_mean_m = tot_trans_m.mean().item()
+        tot_dtrans_max_m = tot_trans_m.max().item()
+
+        # ATE / RPE against Ground Truth if available
+        has_gt = any(getattr(c, 'c2w_gt', None) is not None for c in tr_cams)
+        if has_gt:
+            gt_c2ws = torch.stack([
+                c.c2w_gt if getattr(c, 'c2w_gt', None) is not None else c.c2w.detach()
+                for c in tr_cams
+            ]).to(curr_c2w.device)
+            ate_res = compute_ate(curr_c2w, gt_c2ws)
+            rpe_res = compute_rpe(curr_c2w, gt_c2ws)
+
+    # 3. CSV Logging
+    csv_path = os.path.join(args.model_path, "metrics_per_epoch.csv")
+    csv_exists = os.path.exists(csv_path)
+
+    header = (
+        "epoch,iteration,elapsed_sec,epoch_time_sec,loss,psnr,num_voxels,inside_voxels,inside_pct,"
+        "lr_geo,lr_pose,epoch_drot_mean_deg,epoch_drot_max_deg,epoch_dtrans_mean_m,epoch_dtrans_max_m,"
+        "total_drot_mean_deg,total_drot_max_deg,total_dtrans_mean_m,total_dtrans_max_m,"
+        "ate_trans_rmse_m,ate_rot_rmse_deg,rpe_trans_rmse_m,rpe_rot_rmse_deg\n"
+    )
+
+    ate_t_str = f"{ate_res['trans_rmse']:.6f}" if ate_res is not None else ""
+    ate_r_str = f"{ate_res['rot_rmse_deg']:.4f}" if ate_res is not None else ""
+    rpe_t_str = f"{rpe_res['trans_rmse']:.6f}" if rpe_res is not None else ""
+    rpe_r_str = f"{rpe_res['rot_rmse_deg']:.4f}" if rpe_res is not None else ""
+
+    row = (
+        f"{current_epoch},{iteration},{elapsed_sec:.1f},{epoch_time_sec:.1f},"
+        f"{ema_loss:.6f},{ema_psnr:.4f},{num_voxels},{inside_voxels},{inside_pct:.2f},"
+        f"{lr_geo:.6e},{lr_pose:.6e},"
+        f"{epoch_drot_mean_deg:.4f},{epoch_drot_max_deg:.4f},{epoch_dtrans_mean_m:.6f},{epoch_dtrans_max_m:.6f},"
+        f"{tot_drot_mean_deg:.4f},{tot_drot_max_deg:.4f},{tot_dtrans_mean_m:.6f},{tot_dtrans_max_m:.6f},"
+        f"{ate_t_str},{ate_r_str},{rpe_t_str},{rpe_r_str}\n"
+    )
+
+    with open(csv_path, 'a') as f:
+        if not csv_exists:
+            f.write(header)
+        f.write(row)
+
+    # 4. JSONL Logging
+    jsonl_path = os.path.join(args.model_path, "metrics_per_epoch.jsonl")
+    epoch_dict = {
+        'epoch': current_epoch,
+        'iteration': iteration,
+        'elapsed_sec': round(elapsed_sec, 1),
+        'epoch_time_sec': round(epoch_time_sec, 1),
+        'loss': round(float(ema_loss), 6),
+        'psnr': round(float(ema_psnr), 4),
+        'num_voxels': int(num_voxels),
+        'inside_voxels': int(inside_voxels),
+        'inside_pct': round(float(inside_pct), 2),
+        'lr_geo': float(lr_geo),
+        'lr_pose': float(lr_pose),
+        'epoch_drot_mean_deg': round(float(epoch_drot_mean_deg), 4),
+        'epoch_drot_max_deg': round(float(epoch_drot_max_deg), 4),
+        'epoch_dtrans_mean_m': round(float(epoch_dtrans_mean_m), 6),
+        'epoch_dtrans_max_m': round(float(epoch_dtrans_max_m), 6),
+        'total_drot_mean_deg': round(float(tot_drot_mean_deg), 4),
+        'total_drot_max_deg': round(float(tot_drot_max_deg), 4),
+        'total_dtrans_mean_m': round(float(tot_dtrans_mean_m), 6),
+        'total_dtrans_max_m': round(float(tot_dtrans_max_m), 6),
+    }
+    if ate_res is not None:
+        epoch_dict['ate_trans_rmse_m'] = round(float(ate_res['trans_rmse']), 6)
+        epoch_dict['ate_rot_rmse_deg'] = round(float(ate_res['rot_rmse_deg']), 4)
+    if rpe_res is not None:
+        epoch_dict['rpe_trans_rmse_m'] = round(float(rpe_res['trans_rmse']), 6)
+        epoch_dict['rpe_rot_rmse_deg'] = round(float(rpe_res['rot_rmse_deg']), 4)
+
+    with open(jsonl_path, 'a') as f:
+        f.write(json.dumps(epoch_dict) + "\n")
+
+    # 5. Clean terminal report
+    gt_msg = f" | ATE: {ate_res['trans_rmse']:.4f}m, {ate_res['rot_rmse_deg']:.2f}deg" if (has_gt and ate_res is not None) else ""
+    pose_msg = (
+        f" | dPose/ep: {epoch_drot_mean_deg:.3f}deg, {epoch_dtrans_mean_m*100:.3f}cm"
+        f" | Tot dPose: {tot_drot_mean_deg:.2f}deg, {tot_dtrans_mean_m*100:.2f}cm"
+        if pose_optimizer is not None else ""
+    )
+    epoch_msg = (
+        f"[EPOCH {current_epoch:03d} | iter {iteration:05d} | {epoch_time_sec:.1f}s] "
+        f"Voxels: {num_voxels} ({inside_pct:.1f}% in) | Loss: {ema_loss:.5f} | PSNR: {ema_psnr:.2f}"
+        f"{pose_msg}{gt_msg}"
+    )
+    if progress_bar is not None and hasattr(progress_bar, 'write'):
+        progress_bar.write(epoch_msg)
+    else:
+        print(epoch_msg)
+
+
+def training_report(args, data_pack, voxel_model, iteration, elapsed, ema_psnr, pose_optimizer=None):
 
     voxel_model.freeze_vox_geo()
 
@@ -545,6 +783,25 @@ def training_report(args, data_pack, voxel_model, iteration, elapsed, ema_psnr):
 
         print(f"[EVAL] iter={iteration:6d}  psnr={avg_psnr:.2f}  fps={fps:.0f}")
 
+        # Evaluate camera poses if GT is available
+        pose_stat = None
+        if pose_optimizer is not None:
+            train_cameras = data_pack.get_train_cameras()
+            has_gt = any(getattr(c, 'c2w_gt', None) is not None for c in train_cameras)
+            if has_gt:
+                pred_c2ws = pose_optimizer.get_all_c2w().detach()
+                gt_c2ws = torch.stack([
+                    c.c2w_gt if getattr(c, 'c2w_gt', None) is not None else c.c2w.detach()
+                    for c in train_cameras
+                ]).to(pred_c2ws.device)
+                ate_res = compute_ate(pred_c2ws, gt_c2ws)
+                rpe_res = compute_rpe(pred_c2ws, gt_c2ws)
+                pose_stat = {
+                    'ate': ate_res,
+                    'rpe': rpe_res,
+                }
+                print(f"[POSE EVAL] iter={iteration:6d} | ATE trans (RMSE): {ate_res['trans_rmse']:.4f} m, rot: {ate_res['rot_rmse_deg']:.2f} deg | RPE trans: {rpe_res['trans_rmse']:.4f} m, rot: {rpe_res['rot_rmse_deg']:.2f} deg")
+
         outdir = os.path.join(args.model_path, "test_stat")
         outpath = os.path.join(outdir, f"iter{iteration:06d}.json")
         os.makedirs(outdir, exist_ok=True)
@@ -561,6 +818,8 @@ def training_report(args, data_pack, voxel_model, iteration, elapsed, ema_psnr):
                 'max_w_q': max_w_q,
                 'peak_mem': peak_mem,
             }
+            if pose_stat is not None:
+                stat['pose_metrics'] = pose_stat
             json.dump(stat, f, indent=4)
 
     voxel_model.unfreeze_vox_geo()
@@ -585,10 +844,25 @@ if __name__ == "__main__":
     parser.add_argument("--load_optimizer", action='store_true')
     parser.add_argument("--save_optimizer", action='store_true')
     parser.add_argument("--save_quantized", action='store_true')
+    parser.add_argument("--pose_opt", action='store_true', default=False, help="Enable camera pose optimization")
+    parser.add_argument("--pose_init_mode", type=str, default=None, choices=['colmap', 'identity'], help="Pose initialization mode: 'colmap' or 'identity'")
+    parser.add_argument("--lr_pose", type=float, default=None, help="Initial learning rate for pose refinement")
+    parser.add_argument("--warmup_pose", type=int, default=None, help="Warmup iterations before pose optimization")
+    parser.add_argument("--pose_epoch_interval", type=int, default=None, help="Epoch interval to record metrics")
     args, cmd_lst = parser.parse_known_args()
 
     # Update config from files and command line
     update_config(args.cfg_files, cmd_lst)
+    if args.pose_opt:
+        cfg.pose_opt.pose_opt = True
+    if args.pose_init_mode is not None:
+        cfg.pose_opt.pose_init_mode = args.pose_init_mode
+    if args.lr_pose is not None:
+        cfg.pose_opt.lr_pose = args.lr_pose
+    if args.warmup_pose is not None:
+        cfg.pose_opt.warmup_pose = args.warmup_pose
+    if args.pose_epoch_interval is not None:
+        cfg.pose_opt.pose_epoch_interval = args.pose_epoch_interval
 
     # Global init
     seed_everything(cfg.procedure.seed)

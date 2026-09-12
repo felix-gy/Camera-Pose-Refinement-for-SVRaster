@@ -83,7 +83,7 @@ def rasterize_voxels(
     in_frusts_idx = torch.where(n_duplicates > 0)[0]
 
     # Forward voxel parameters
-    cam_pos = raster_settings.c2w_matrix[:3, 3]
+    cam_pos = raster_settings.c2w_matrix[:3, 3].detach()
     vox_params = vox_fn(in_frusts_idx, cam_pos, raster_settings.color_mode)
     geos = vox_params['geos']
     rgbs = vox_params['rgbs']
@@ -124,6 +124,7 @@ def rasterize_voxels(
         geos,
         rgbs,
         subdiv_p,
+        raster_settings.c2w_matrix,
     )
 
 
@@ -139,6 +140,7 @@ class _RasterizeVoxels(torch.autograd.Function):
         geos,
         rgbs,
         subdiv_p,
+        c2w_matrix,
     ):
 
         need_distortion = raster_settings.lambda_dist > 0
@@ -232,7 +234,18 @@ class _RasterizeVoxels(torch.autograd.Function):
             raster_settings.debug,
         )
 
-        dL_dgeos, dL_drgbs, subdiv_p_bw = _C.rasterize_voxels_backward(*args)
+        ret = _C.rasterize_voxels_backward(*args)
+        if len(ret) == 4:
+            dL_dgeos, dL_drgbs, subdiv_p_bw, dL_dc2w = ret
+        else:
+            dL_dgeos, dL_drgbs, subdiv_p_bw = ret
+            dL_dc2w = None
+            if c2w_matrix is not None and c2w_matrix.requires_grad:
+                if not hasattr(_RasterizeVoxels, '_warned_recompile'):
+                    print("[WARNING] svraster_cuda extension returned 3 tensors instead of 4.")
+                    print("[WARNING] The CUDA extension needs to be recompiled to enable camera pose gradients:")
+                    print("          cd cuda && python setup.py build_ext --inplace")
+                    _RasterizeVoxels._warned_recompile = True
 
         grads = (
             None, # => raster_settings
@@ -243,6 +256,7 @@ class _RasterizeVoxels(torch.autograd.Function):
             dL_dgeos, # => geos
             dL_drgbs, # => rgbs
             subdiv_p_bw, # => subdivision priority
+            dL_dc2w, # => c2w_matrix
         )
 
         return grads
@@ -264,7 +278,7 @@ class SH_eval(torch.autograd.Function):
         if torch.is_tensor(vox_centers) and vox_centers.requires_grad:
             raise NotImplementedError
         if torch.is_tensor(cam_pos) and cam_pos.requires_grad:
-            raise NotImplementedError
+            cam_pos = cam_pos.detach()
         if torch.is_tensor(viewdir) and viewdir.requires_grad:
             raise NotImplementedError
 

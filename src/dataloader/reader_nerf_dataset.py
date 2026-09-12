@@ -156,6 +156,7 @@ def read_cameras_from_json(source_path, meta_fname, camera_creator):
             cy_p=cy_p,
             sparse_pt=sparse_pt,
             image_name=image_path.name,
+            c2w_gt=c2w.copy(),
         ))
 
     # Load all cameras concurrently

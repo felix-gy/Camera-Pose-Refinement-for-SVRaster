@@ -101,6 +101,7 @@ def read_colmap_dataset(source_path, image_dir_name, mask_dir_name, use_test, te
             sparse_pt=sparse_pt,
             image_name=image_path.name,
             mask=mask,
+            c2w_gt=np.linalg.inv(w2c).copy(),
         ))
 
     # Load all cameras concurrently
