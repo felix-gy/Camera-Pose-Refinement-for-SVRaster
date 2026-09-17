@@ -336,9 +336,10 @@ def training(args):
 
         # Optimizer step
         optimizer.step()
-        if optim_pose is not None and iteration > cfg.pose_opt.warmup_pose:
-            optim_pose.step()
 
+        if optim_pose is not None and iteration > cfg.pose_opt.warmup_pose:
+            if iteration % 1000  > 300:
+                optim_pose.step()
         ######################################################
         # Start adaptive voxels pruning and subdividing
         ######################################################

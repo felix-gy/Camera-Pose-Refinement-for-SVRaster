@@ -217,7 +217,7 @@ class CameraCreator:
         if mask is not None:
             size = tensor.shape[-2:][::-1]
             if mask.size != size:
-                mask = mask.resize(size)
+                mask = mask.reshape(size)
             mask = torch.tensor(np.array(mask), dtype=torch.float32) / 255.0
             if len(mask.shape) == 3:
                 mask = mask.mean(-1)
