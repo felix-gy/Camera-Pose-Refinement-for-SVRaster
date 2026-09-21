@@ -88,10 +88,12 @@ def training(args):
         white_background=cfg.model.white_background,
         black_background=cfg.model.black_background,
     )
+    source_model_path = args.load_model_path if getattr(args, 'load_model_path', None) else args.model_path
+
     # Load checkpoint if specified, preview progress
-    if args.load_iteration:
+    if args.load_iteration is not None:
         loaded_iter = voxel_model.load_iteration(
-            args.model_path, args.load_iteration)
+            source_model_path, args.load_iteration)
     else:
         loaded_iter = None
         voxel_model.model_init(
@@ -106,7 +108,7 @@ def training(args):
             cameras=tr_cams,
         )
 
-    first_iter = loaded_iter if loaded_iter else 1
+    first_iter = loaded_iter if loaded_iter is not None else 1
     print(f"Start optmization from iters={first_iter}.")
 
     # Init optimizer
@@ -128,11 +130,16 @@ def training(args):
         return optimizer, scheduler
 
     optimizer, scheduler = create_trainer()
-    if loaded_iter and args.load_optimizer:
-        optim_ckpt = torch.load(os.path.join(args.model_path, "optim.pt"))
-        optimizer.load_state_dict(optim_ckpt['optim'])
-        scheduler.load_state_dict(optim_ckpt['sched'])
-        del optim_ckpt
+    if loaded_iter is not None and args.load_optimizer:
+        optim_path = os.path.join(source_model_path, "optim.pt")
+        if os.path.exists(optim_path):
+            optim_ckpt = torch.load(optim_path)
+            optimizer.load_state_dict(optim_ckpt['optim'])
+            scheduler.load_state_dict(optim_ckpt['sched'])
+            del optim_ckpt
+            print(f"[OPTIM] Loaded optimizer and scheduler from {optim_path}")
+        else:
+            print(f"[OPTIM WARNING] Could not find {optim_path} to load optimizer state.")
 
     # Camera Pose Optimizer initialization
     pose_optimizer = None
@@ -153,10 +160,10 @@ def training(args):
         gamma = (cfg.pose_opt.lr_pose_end / cfg.pose_opt.lr_pose) ** (1.0 / total_decay_steps)
         sched_pose = torch.optim.lr_scheduler.ExponentialLR(optim_pose, gamma=gamma)
 
-        if loaded_iter and args.load_optimizer:
-            pose_ckpt_path = os.path.join(args.model_path, f"pose_opt_{loaded_iter:06d}.pt")
+        if loaded_iter is not None and args.load_optimizer:
+            pose_ckpt_path = os.path.join(source_model_path, f"pose_opt_{loaded_iter:06d}.pt")
             if not os.path.exists(pose_ckpt_path):
-                pose_ckpt_path = os.path.join(args.model_path, "pose_opt.pt")
+                pose_ckpt_path = os.path.join(source_model_path, "pose_opt.pt")
             if os.path.exists(pose_ckpt_path):
                 pose_ckpt = torch.load(pose_ckpt_path, map_location="cuda")
                 pose_optimizer.load_state_dict_poses(pose_ckpt['poses'])
@@ -174,6 +181,17 @@ def training(args):
         'prev_c2w': pose_optimizer.get_all_c2w().detach().clone() if pose_optimizer is not None else None,
         'last_elapsed': 0.0
     }
+
+    target_stat_iters = set()
+    if not getattr(args, 'disable_voxel_stats', False):
+        if hasattr(args, 'voxel_stats_iterations') and args.voxel_stats_iterations is not None:
+            target_stat_iters.update(args.voxel_stats_iterations)
+        else:
+            target_stat_iters.update([5000, 10000, 15000, 20000])
+        if hasattr(args, 'checkpoint_iterations') and args.checkpoint_iterations:
+            target_stat_iters.update(args.checkpoint_iterations)
+        target_stat_iters.add(cfg.procedure.n_iter)
+    print(f"[VOXEL STATS] Configured iterations to save voxel statistics: {sorted(list(target_stat_iters))}")
 
     tr_render_opt = {
         'track_max_w': False,
@@ -356,11 +374,22 @@ def training(args):
             iteration <= cfg.procedure.subdivide_until and \
             voxel_model.num_voxels < cfg.procedure.subdivide_max_num)
 
-        if need_pruning or need_subdividing:
+        need_save_voxel_stats = (iteration in target_stat_iters)
+
+        if need_pruning or need_subdividing or need_save_voxel_stats:
             # Track voxel statistic
             stat_pkg = voxel_model.compute_training_stat(camera_lst=tr_cams)
-            # Cache scheduler state
-            scheduler_state = scheduler.state_dict()
+            if need_pruning or need_subdividing:
+                # Cache scheduler state
+                scheduler_state = scheduler.state_dict()
+
+        if need_save_voxel_stats:
+            save_voxel_training_stats(
+                args=args,
+                iteration=iteration,
+                voxel_model=voxel_model,
+                stat_pkg=stat_pkg
+            )
 
         if need_pruning:
             ori_n = voxel_model.num_voxels
@@ -676,6 +705,160 @@ def record_epoch_metrics(
         print(epoch_msg)
 
 
+def save_voxel_training_stats(args, iteration, voxel_model, stat_pkg):
+    """
+    Save detailed per-voxel statistics and system VRAM before pruning, subdividing,
+    and subdivision priority reset.
+
+    Per-voxel fields:
+    - voxel_model.vox_center: [N, 3] (float32)
+    - voxel_model.vox_size: [N, 1] (float32)
+    - voxel_model.octlevel: [N, 1] (int8)
+    - voxel_model.subdivision_priority: [N, 1] (float32, or None)
+    - stat_pkg['max_w']: [N, 1] (float32)
+    - stat_pkg['view_cnt']: [N, 1] (float32)
+    - stat_pkg['min_samp_interval']: [N, 1] (float32)
+
+    Global metrics:
+    - n_voxels: int
+    - vram: dict with allocated, reserved, and peak memory in bytes, MB, GB.
+    """
+    stats_dir = os.path.join(args.model_path, "voxel_stats")
+    os.makedirs(stats_dir, exist_ok=True)
+
+    n_voxels = int(voxel_model.num_voxels)
+
+    # Detach tensors and transfer to CPU
+    vox_center = voxel_model.vox_center.detach().clone().cpu()
+    vox_size = voxel_model.vox_size.detach().clone().cpu()
+    octlevel = voxel_model.octlevel.detach().clone().cpu()
+
+    subdiv_p = voxel_model.subdivision_priority
+    if subdiv_p is not None:
+        subdivision_priority = subdiv_p.detach().clone().cpu()
+    else:
+        subdivision_priority = None
+
+    max_w = stat_pkg['max_w'].detach().clone().cpu()
+    view_cnt = stat_pkg['view_cnt'].detach().clone().cpu()
+    min_samp_interval = stat_pkg['min_samp_interval'].detach().clone().cpu()
+
+    # VRAM statistics
+    if torch.cuda.is_available():
+        alloc_b = torch.cuda.memory_allocated()
+        max_alloc_b = torch.cuda.max_memory_allocated()
+        res_b = torch.cuda.memory_reserved()
+        max_res_b = torch.cuda.max_memory_reserved()
+    else:
+        alloc_b = 0
+        max_alloc_b = 0
+        res_b = 0
+        max_res_b = 0
+
+    vram_dict = {
+        'allocated_bytes': int(alloc_b),
+        'allocated_mb': float(alloc_b / (1024 ** 2)),
+        'allocated_gb': float(alloc_b / (1024 ** 3)),
+        'max_allocated_bytes': int(max_alloc_b),
+        'max_allocated_mb': float(max_alloc_b / (1024 ** 2)),
+        'max_allocated_gb': float(max_alloc_b / (1024 ** 3)),
+        'reserved_bytes': int(res_b),
+        'reserved_mb': float(res_b / (1024 ** 2)),
+        'reserved_gb': float(res_b / (1024 ** 3)),
+        'max_reserved_bytes': int(max_res_b),
+        'max_reserved_mb': float(max_res_b / (1024 ** 2)),
+        'max_reserved_gb': float(max_res_b / (1024 ** 3)),
+    }
+
+    has_subdiv = subdivision_priority is not None and subdivision_priority.numel() > 0
+    if has_subdiv:
+        subdiv_flat = subdivision_priority.view(-1).float()
+        sum_subdiv_p = float(subdiv_flat.sum().item())
+        median_subdiv_p = float(subdiv_flat.median().item())
+        quantiles = torch.quantile(subdiv_flat, torch.tensor([0.90, 0.95, 0.99]))
+        p90_subdiv_p = float(quantiles[0].item())
+        p95_subdiv_p = float(quantiles[1].item())
+        p99_subdiv_p = float(quantiles[2].item())
+    else:
+        sum_subdiv_p = float('nan')
+        median_subdiv_p = float('nan')
+        p90_subdiv_p = float('nan')
+        p95_subdiv_p = float('nan')
+        p99_subdiv_p = float('nan')
+
+    payload = {
+        'iteration': int(iteration),
+        'n_voxels': n_voxels,
+        'vox_center': vox_center,
+        'vox_size': vox_size,
+        'octlevel': octlevel,
+        'subdivision_priority': subdivision_priority,
+        'subdivision_priority_stats': {
+            'sum': sum_subdiv_p,
+            'median': median_subdiv_p,
+            'p90': p90_subdiv_p,
+            'p95': p95_subdiv_p,
+            'p99': p99_subdiv_p,
+        },
+        'max_w': max_w,
+        'view_cnt': view_cnt,
+        'min_samp_interval': min_samp_interval,
+        'vram': vram_dict,
+        'vram_allocated_mb': vram_dict['allocated_mb'],
+        'vram_max_allocated_mb': vram_dict['max_allocated_mb'],
+        'vram_reserved_mb': vram_dict['reserved_mb'],
+        'vram_max_reserved_mb': vram_dict['max_reserved_mb'],
+    }
+
+    pt_filename = f"voxel_stats_iter{iteration:06d}.pt"
+    pt_path = os.path.join(stats_dir, pt_filename)
+    torch.save(payload, pt_path)
+
+    # Append to summary CSV
+    csv_path = os.path.join(stats_dir, "voxel_stats_summary.csv")
+    csv_header = (
+        "iteration,n_voxels,vram_allocated_mb,vram_max_allocated_mb,"
+        "vram_reserved_mb,vram_max_reserved_mb,mean_max_w,mean_view_cnt,"
+        "mean_min_samp_interval,has_subdiv_priority,sum_subdivision_priority,"
+        "median_subdivision_priority,p90_subdivision_priority,p95_subdivision_priority,"
+        "p99_subdivision_priority,file_path\n"
+    )
+    file_exists = os.path.isfile(csv_path)
+
+    mean_max_w = float(max_w.mean().item()) if max_w.numel() > 0 else 0.0
+    mean_view_cnt = float(view_cnt.mean().item()) if view_cnt.numel() > 0 else 0.0
+    obs_mask = max_w > 0
+    if obs_mask.any():
+        mean_samp = float(min_samp_interval[obs_mask].mean().item())
+    else:
+        mean_samp = float(min_samp_interval.mean().item()) if min_samp_interval.numel() > 0 else 0.0
+
+    sum_str = f"{sum_subdiv_p:.6e}" if not np.isnan(sum_subdiv_p) else "nan"
+    median_str = f"{median_subdiv_p:.6e}" if not np.isnan(median_subdiv_p) else "nan"
+    p90_str = f"{p90_subdiv_p:.6e}" if not np.isnan(p90_subdiv_p) else "nan"
+    p95_str = f"{p95_subdiv_p:.6e}" if not np.isnan(p95_subdiv_p) else "nan"
+    p99_str = f"{p99_subdiv_p:.6e}" if not np.isnan(p99_subdiv_p) else "nan"
+
+    row_str = (
+        f"{iteration},{n_voxels},{vram_dict['allocated_mb']:.2f},{vram_dict['max_allocated_mb']:.2f},"
+        f"{vram_dict['reserved_mb']:.2f},{vram_dict['max_reserved_mb']:.2f},"
+        f"{mean_max_w:.6f},{mean_view_cnt:.2f},{mean_samp:.6f},"
+        f"{has_subdiv},{sum_str},{median_str},{p90_str},{p95_str},{p99_str},{pt_filename}\n"
+    )
+
+    with open(csv_path, 'a') as f:
+        if not file_exists:
+            f.write(csv_header)
+        f.write(row_str)
+
+    subdiv_msg = f", SubdivP(med={median_str}, p90={p90_str}, p99={p99_str})" if has_subdiv else ""
+    print(
+        f"[VOXEL STATS] Iteration {iteration:06d}: N_voxels={n_voxels:,}, "
+        f"VRAM_alloc={vram_dict['allocated_mb']:.1f}MB (Peak={vram_dict['max_allocated_mb']:.1f}MB)"
+        f"{subdiv_msg} -> saved {pt_path}"
+    )
+
+
 def training_report(args, data_pack, voxel_model, iteration, elapsed, ema_psnr, pose_optimizer=None):
 
     voxel_model.freeze_vox_geo()
@@ -841,19 +1024,33 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="*", type=int, default=[-1])
     parser.add_argument("--pg_view_every", type=int, default=200)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--load_iteration", type=int, default=None)
-    parser.add_argument("--load_optimizer", action='store_true')
-    parser.add_argument("--save_optimizer", action='store_true')
-    parser.add_argument("--save_quantized", action='store_true')
+    parser.add_argument("--voxel_stats_iterations", nargs="*", type=int, default=[5000, 10000, 15000, 20000], help="Iterations to save detailed per-voxel statistics")
+    parser.add_argument("--disable_voxel_stats", action="store_true", default=False, help="Disable saving per-voxel statistics")
+    parser.add_argument("--load_iteration", type=int, default=None, help="Iteration of checkpoint to load (-1 for latest)")
+    parser.add_argument("--load_model_path", type=str, default=None, help="Optional model directory path to load checkpoint from (defaults to --model_path)")
+    parser.add_argument("--load_optimizer", action='store_true', help="Load optimizer and scheduler state")
+    parser.add_argument("--save_optimizer", action='store_true', help="Save optimizer state at checkpoints")
+    parser.add_argument("--save_quantized", action='store_true', help="Save quantized model checkpoint to reduce file size")
     parser.add_argument("--pose_opt", action='store_true', default=False, help="Enable camera pose optimization")
     parser.add_argument("--pose_init_mode", type=str, default=None, choices=['colmap', 'identity'], help="Pose initialization mode: 'colmap' or 'identity'")
     parser.add_argument("--lr_pose", type=float, default=None, help="Initial learning rate for pose refinement")
     parser.add_argument("--warmup_pose", type=int, default=None, help="Warmup iterations before pose optimization")
     parser.add_argument("--pose_epoch_interval", type=int, default=None, help="Epoch interval to record metrics")
+    parser.add_argument("--fast_10k", "--10k", action="store_true", default=False, help="Shift and scale the entire 20000-step training logic to 10000 steps.")
+    parser.add_argument("--n_iter", "--iter", type=int, default=None, help="Set total iterations (e.g. 10000) and scale schedules proportionally.")
+    parser.add_argument("--sche_mult", type=float, default=None, help="Schedule multiplier factor (e.g. 0.5 for 10k)")
+    parser.add_argument("--keep_lr", action="store_true", default=False, help="Do not scale learning rates when scaling iterations (keeps original LR)")
     args, cmd_lst = parser.parse_known_args()
 
     # Update config from files and command line
     update_config(args.cfg_files, cmd_lst)
+    if args.fast_10k:
+        cfg.procedure.sche_mult = 0.5
+    elif args.sche_mult is not None:
+        cfg.procedure.sche_mult = args.sche_mult
+    elif args.n_iter is not None:
+        cfg.procedure.sche_mult = float(args.n_iter) / 20000.0
+
     if args.pose_opt:
         cfg.pose_opt.pose_opt = True
     if args.pose_init_mode is not None:
@@ -870,7 +1067,7 @@ if __name__ == "__main__":
     torch.cuda.set_device(torch.device("cuda:0"))
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    # Setup output folder and dump config
+    # Setup output folder
     if not args.model_path:
         datetime_str = datetime.datetime.now().strftime("%Y-%m%d-%H%M")
         unique_str = str(uuid.uuid4())[:6]
@@ -878,16 +1075,15 @@ if __name__ == "__main__":
         args.model_path = os.path.join(f"./output", folder_name)
 
     os.makedirs(args.model_path, exist_ok=True)
-    with open(os.path.join(args.model_path, "config.yaml"), "w") as f:
-            f.write(cfg.dump())
-    print(f"Output folder: {args.model_path}")
 
     # Apply scheduler scaling
     if cfg.procedure.sche_mult != 1:
         sche_mult = cfg.procedure.sche_mult
 
-        for key in ['geo_lr', 'sh0_lr', 'shs_lr']:
-            cfg.optimizer[key] /= sche_mult
+        if not args.keep_lr:
+            for key in ['geo_lr', 'sh0_lr', 'shs_lr']:
+                cfg.optimizer[key] /= sche_mult
+
         cfg.optimizer.lr_decay_ckpt = [
             round(v * sche_mult) if v > 0 else v
             for v in cfg.optimizer.lr_decay_ckpt]
@@ -897,17 +1093,50 @@ if __name__ == "__main__":
                 'n_dmean_from', 'n_dmean_end',
                 'n_dmed_from', 'n_dmed_end',
                 'depthanythingv2_from', 'depthanythingv2_end',
-                'mast3r_metric_depth_from', 'mast3r_metric_depth_end']:
-            cfg.regularizer[key] = round(cfg.regularizer[key] * sche_mult)
+                'mast3r_metric_depth_from', 'mast3r_metric_depth_end',
+                'depth_ranking_from', 'depth_ranking_end']:
+            if key in cfg.regularizer:
+                cfg.regularizer[key] = round(cfg.regularizer[key] * sche_mult)
 
         for key in [
                 'n_iter',
                 'adapt_from', 'adapt_every',
                 'prune_until', 'subdivide_until', 'subdivide_all_until']:
             cfg.procedure[key] = round(cfg.procedure[key] * sche_mult)
+
         cfg.procedure.reset_sh_ckpt = [
             round(v * sche_mult) if v > 0 else v
             for v in cfg.procedure.reset_sh_ckpt]
+
+        if hasattr(cfg, 'auto_exposure') and 'auto_exposure_upd_ckpt' in cfg.auto_exposure:
+            cfg.auto_exposure.auto_exposure_upd_ckpt = [
+                round(v * sche_mult) if v > 0 else v
+                for v in cfg.auto_exposure.auto_exposure_upd_ckpt]
+
+        if args.voxel_stats_iterations:
+            args.voxel_stats_iterations = [
+                round(v * sche_mult) if v > 0 else v
+                for v in args.voxel_stats_iterations]
+
+        if args.checkpoint_iterations:
+            args.checkpoint_iterations = [
+                round(v * sche_mult) if v > 0 else v
+                for v in args.checkpoint_iterations]
+
+        print("=" * 80)
+        print(f"[SCHEDULE SCALING] Transferred 20,000 schedule to {cfg.procedure.n_iter:,} iterations (multiplier = {sche_mult}):")
+        print(f"  - Total Iterations (n_iter)   : 20,000 -> {cfg.procedure.n_iter:,}")
+        print(f"  - Adapt Every (adapt_every)   : 1,000  -> {cfg.procedure.adapt_every:,}")
+        print(f"  - Adapt From (adapt_from)     : 1,000  -> {cfg.procedure.adapt_from:,}")
+        print(f"  - Subdivide Until             : 15,000 -> {cfg.procedure.subdivide_until:,}")
+        print(f"  - Prune Until                 : 18,000 -> {cfg.procedure.prune_until:,}")
+        print(f"  - LR Decay Checkpoints        : {cfg.optimizer.lr_decay_ckpt}")
+        print(f"  - Voxel Stats Checkpoints     : {args.voxel_stats_iterations}")
+        print("=" * 80)
+
+    with open(os.path.join(args.model_path, "config.yaml"), "w") as f:
+        f.write(cfg.dump())
+    print(f"Output folder: {args.model_path}")
 
     # Update negative iterations
     for i in range(len(args.test_iterations)):
@@ -916,6 +1145,10 @@ if __name__ == "__main__":
     for i in range(len(args.checkpoint_iterations)):
         if args.checkpoint_iterations[i] < 0:
             args.checkpoint_iterations[i] += cfg.procedure.n_iter + 1
+    if args.voxel_stats_iterations:
+        for i in range(len(args.voxel_stats_iterations)):
+            if args.voxel_stats_iterations[i] < 0:
+                args.voxel_stats_iterations[i] += cfg.procedure.n_iter + 1
 
     # Launch training loop
     training(args)
