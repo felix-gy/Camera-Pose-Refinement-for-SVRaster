@@ -18,6 +18,9 @@ cfg.model = CfgNode(dict(
     ss = 1.5,                 # Super-sampling rates for anti-aliasing
     white_background = False, # Assum white background
     black_background = False, # Assum black background
+    deferred_appearance = False, # Use deferred neural appearance instead of SH1-SH3
+    appearance_feat_dim = 8,  # Latent feature dimension per grid point
+    appearance_hidden_dim = 32, # Hidden layer dimension for deferred appearance MLP
 ))
 
 cfg.data = CfgNode(dict(
@@ -52,6 +55,8 @@ cfg.optimizer = CfgNode(dict(
     geo_lr = 0.025,
     sh0_lr = 0.010,
     shs_lr = 0.00025,
+    feat_lr = 0.00025,
+    decoder_lr = 0.001,
 
     optim_beta1 = 0.1,
     optim_beta2 = 0.99,
@@ -141,6 +146,7 @@ cfg.init = CfgNode(dict(
     geo_init = -10.0,
     sh0_init = 0.5,
     shs_init = 0.0,
+    appearance_feat_std = 0.01,
 
     sh_degree_init = 3,
 

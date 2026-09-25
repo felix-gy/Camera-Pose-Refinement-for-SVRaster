@@ -170,6 +170,9 @@ if __name__ == "__main__":
         ss=cfg.model.ss,
         white_background=cfg.model.white_background,
         black_background=cfg.model.black_background,
+        deferred_appearance=cfg.model.deferred_appearance,
+        appearance_feat_dim=cfg.model.appearance_feat_dim,
+        appearance_hidden_dim=cfg.model.appearance_hidden_dim,
     )
     loaded_iter = voxel_model.load_iteration(args.model_path, args.iteration)
 

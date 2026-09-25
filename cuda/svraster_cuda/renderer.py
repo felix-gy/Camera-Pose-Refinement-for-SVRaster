@@ -87,6 +87,7 @@ def rasterize_voxels(
     vox_params = vox_fn(in_frusts_idx, cam_pos, raster_settings.color_mode)
     geos = vox_params['geos']
     rgbs = vox_params['rgbs']
+    feats = vox_params.get('feats', None)
     subdiv_p = vox_params['subdiv_p']
 
     # Some voxel parameters checking
@@ -96,6 +97,8 @@ def rasterize_voxels(
         raise Exception(f"Expect rgbs in ({N}, 3) but got", rgbs.shape)
     if subdiv_p.shape[0] != N:
         raise Exception(f"Expect subdiv_p in ({N}, 1) but got", subdiv_p.shape)
+    if feats is not None and (len(feats.shape) != 3 or feats.shape[:2] != (N, 8)):
+        raise Exception(f"Expect feats in ({N}, 8, feat_dim) but got", feats.shape)
 
     if geos.device != device:
         raise Exception("Device mismatch: geos.")
@@ -103,6 +106,8 @@ def rasterize_voxels(
         raise Exception("Device mismatch: rgbs.")
     if subdiv_p.device != device:
         raise Exception("Device mismatch: subdiv_p.")
+    if feats is not None and feats.device != device:
+        raise Exception("Device mismatch: feats.")
 
     # Some checking for regularizations
     if raster_settings.lambda_R_concen > 0:
@@ -114,6 +119,8 @@ def rasterize_voxels(
         if raster_settings.gt_color.device != device:
             raise Exception("Device mismatch.")
 
+    feats_tensor = feats if feats is not None else torch.empty(0, device=device)
+
     # Involk differentiable voxels rasterization.
     return _RasterizeVoxels.apply(
         raster_settings,
@@ -123,6 +130,7 @@ def rasterize_voxels(
         vox_lengths,
         geos,
         rgbs,
+        feats_tensor,
         subdiv_p,
         raster_settings.c2w_matrix,
     )
@@ -139,6 +147,7 @@ class _RasterizeVoxels(torch.autograd.Function):
         vox_lengths,
         geos,
         rgbs,
+        feats,
         subdiv_p,
         c2w_matrix,
     ):
@@ -166,32 +175,37 @@ class _RasterizeVoxels(torch.autograd.Function):
             vox_lengths,
             geos,
             rgbs,
+            feats,
 
             geomBuffer,
 
             raster_settings.debug,
         )
 
-        num_rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w = _C.rasterize_voxels(*args)
+        num_rendered, binningBuffer, imgBuffer, out_color, out_feat, out_depth, out_normal, out_T, max_w = _C.rasterize_voxels(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
+        ctx.has_feats = (feats.numel() > 0)
         ctx.save_for_backward(
             octree_paths, vox_centers, vox_lengths,
-            geos, rgbs,
+            geos, rgbs, feats,
             geomBuffer, binningBuffer, imgBuffer, out_T, out_depth, out_normal)
         ctx.mark_non_differentiable(max_w)
-        return out_color, out_depth, out_normal, out_T, max_w
+        out_feat_ret = out_feat if ctx.has_feats else None
+        return out_color, out_feat_ret, out_depth, out_normal, out_T, max_w
 
     @staticmethod
-    def backward(ctx, dL_dout_color, dL_dout_depth, dL_dout_normal, dL_dout_T, dL_dmax_w):
+    def backward(ctx, dL_dout_color, dL_dout_feat, dL_dout_depth, dL_dout_normal, dL_dout_T, dL_dmax_w):
         # Restore necessary values from context
         raster_settings = ctx.raster_settings
         num_rendered = ctx.num_rendered
         octree_paths, vox_centers, vox_lengths, \
-            geos, rgbs, \
+            geos, rgbs, feats, \
             geomBuffer, binningBuffer, imgBuffer, out_T, out_depth, out_normal = ctx.saved_tensors
+
+        dL_dout_feat_tensor = dL_dout_feat if (dL_dout_feat is not None) else torch.empty(0, device=geos.device)
 
         args = (
             num_rendered,
@@ -211,6 +225,7 @@ class _RasterizeVoxels(torch.autograd.Function):
             vox_lengths,
             geos,
             rgbs,
+            feats,
 
             geomBuffer,
             binningBuffer,
@@ -218,6 +233,7 @@ class _RasterizeVoxels(torch.autograd.Function):
             out_T,
 
             dL_dout_color,
+            dL_dout_feat_tensor,
             dL_dout_depth,
             dL_dout_normal,
             dL_dout_T,
@@ -235,17 +251,18 @@ class _RasterizeVoxels(torch.autograd.Function):
         )
 
         ret = _C.rasterize_voxels_backward(*args)
-        if len(ret) == 4:
+        if len(ret) == 5:
+            dL_dgeos, dL_drgbs, dL_dfeats, subdiv_p_bw, dL_dc2w = ret
+        elif len(ret) == 4:
             dL_dgeos, dL_drgbs, subdiv_p_bw, dL_dc2w = ret
+            dL_dfeats = None
         else:
             dL_dgeos, dL_drgbs, subdiv_p_bw = ret
+            dL_dfeats = None
             dL_dc2w = None
-            if c2w_matrix is not None and c2w_matrix.requires_grad:
-                if not hasattr(_RasterizeVoxels, '_warned_recompile'):
-                    print("[WARNING] svraster_cuda extension returned 3 tensors instead of 4.")
-                    print("[WARNING] The CUDA extension needs to be recompiled to enable camera pose gradients:")
-                    print("          cd cuda && python setup.py build_ext --inplace")
-                    _RasterizeVoxels._warned_recompile = True
+
+        if not ctx.has_feats or (dL_dfeats is not None and dL_dfeats.numel() == 0):
+            dL_dfeats = None
 
         grads = (
             None, # => raster_settings
@@ -255,6 +272,7 @@ class _RasterizeVoxels(torch.autograd.Function):
             None, # => vox_lengths
             dL_dgeos, # => geos
             dL_drgbs, # => rgbs
+            dL_dfeats, # => feats
             subdiv_p_bw, # => subdivision priority
             dL_dc2w, # => c2w_matrix
         )

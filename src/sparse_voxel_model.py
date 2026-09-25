@@ -22,6 +22,9 @@ class SparseVoxelModel(SVConstructor, SVProperties, SVRenderer, SVAdaptive, SVIn
                  ss=1.5,                 # Super-sampling rates for anti-aliasing
                  white_background=False, # Assum white background
                  black_background=False, # Assum black background
+                 deferred_appearance=False, # Deferred neural appearance
+                 appearance_feat_dim=8,  # Latent feature dimension per grid point
+                 appearance_hidden_dim=32, # Hidden layer dimension for MLP decoder
                  ):
         '''
         Setup of the model meta. At this point, no voxel is allocated.
@@ -36,10 +39,13 @@ class SparseVoxelModel(SVConstructor, SVProperties, SVRenderer, SVAdaptive, SVIn
         super().__init__()
 
         self.n_samp_per_vox = n_samp_per_vox
-        self.max_sh_degree = sh_degree
+        self.max_sh_degree = 0 if deferred_appearance else sh_degree
         self.ss = ss
         self.white_background = white_background
         self.black_background = black_background
+        self.deferred_appearance = deferred_appearance
+        self.appearance_feat_dim = appearance_feat_dim
+        self.appearance_hidden_dim = appearance_hidden_dim
 
         # List the variable names
         self.per_voxel_attr_lst = [
@@ -52,6 +58,12 @@ class SparseVoxelModel(SVConstructor, SVProperties, SVRenderer, SVAdaptive, SVIn
         self.grid_pts_param_lst = [
             '_geo_grid_pts',
         ]
+        if self.deferred_appearance:
+            self.grid_pts_param_lst.append('_feat_grid_pts')
+
+        self.grid_features_param_lst = [
+            '_geo_grid_features',
+        ]
 
         # To be init from model_init
         self.scene_center = None
@@ -59,9 +71,19 @@ class SparseVoxelModel(SVConstructor, SVProperties, SVRenderer, SVAdaptive, SVIn
         self.inside_extent = None
         self.octpath = None
         self.octlevel = None
-        self.active_sh_degree = sh_degree
+        self.active_sh_degree = self.max_sh_degree
 
         self._geo_grid_pts = None
+        self._feat_grid_pts = None
         self._sh0 = None
         self._shs = None
         self._subdiv_p = None
+
+        if self.deferred_appearance:
+            from src.models.deferred_appearance import DeferredAppearanceMLP
+            self.appearance_mlp = DeferredAppearanceMLP(
+                feat_dim=self.appearance_feat_dim,
+                hidden_dim=self.appearance_hidden_dim
+            ).cuda()
+        else:
+            self.appearance_mlp = None

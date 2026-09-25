@@ -87,6 +87,9 @@ def training(args):
         ss=cfg.model.ss,
         white_background=cfg.model.white_background,
         black_background=cfg.model.black_background,
+        deferred_appearance=cfg.model.deferred_appearance,
+        appearance_feat_dim=cfg.model.appearance_feat_dim,
+        appearance_hidden_dim=cfg.model.appearance_hidden_dim,
     )
     source_model_path = args.load_model_path if getattr(args, 'load_model_path', None) else args.model_path
 
@@ -106,6 +109,8 @@ def training(args):
             sh0_init=cfg.init.sh0_init,
             shs_init=cfg.init.shs_init,
             cameras=tr_cams,
+            appearance_feat_dim=getattr(cfg.model, 'appearance_feat_dim', 8),
+            appearance_feat_std=getattr(cfg.init, 'appearance_feat_std', getattr(cfg.model, 'appearance_feat_std', 0.01)),
         )
 
     first_iter = loaded_iter if loaded_iter is not None else 1
@@ -114,12 +119,17 @@ def training(args):
     # Init optimizer
     def create_trainer():
         # The pytorch built-in `torch.optim.Adam` also works
+        params = [
+            {'params': [voxel_model._geo_grid_pts], 'lr': cfg.optimizer.geo_lr},
+            {'params': [voxel_model._sh0], 'lr': cfg.optimizer.sh0_lr},
+        ]
+        if getattr(voxel_model, '_shs', None) is not None and voxel_model._shs.numel() > 0:
+            params.append({'params': [voxel_model._shs], 'lr': cfg.optimizer.shs_lr})
+        if getattr(voxel_model, 'deferred_appearance', False) and getattr(voxel_model, '_feat_grid_pts', None) is not None:
+            params.append({'params': [voxel_model._feat_grid_pts], 'lr': cfg.optimizer.feat_lr})
+
         optimizer = svraster_cuda.sparse_adam.SparseAdam(
-            [
-                {'params': [voxel_model._geo_grid_pts], 'lr': cfg.optimizer.geo_lr},
-                {'params': [voxel_model._sh0], 'lr': cfg.optimizer.sh0_lr},
-                {'params': [voxel_model._shs], 'lr': cfg.optimizer.shs_lr},
-            ],
+            params,
             betas=(cfg.optimizer.optim_beta1, cfg.optimizer.optim_beta2),
             eps=cfg.optimizer.optim_eps)
 
@@ -130,12 +140,30 @@ def training(args):
         return optimizer, scheduler
 
     optimizer, scheduler = create_trainer()
+
+    decoder_optimizer = None
+    decoder_scheduler = None
+    if getattr(voxel_model, 'deferred_appearance', False) and getattr(voxel_model, 'appearance_mlp', None) is not None:
+        decoder_optimizer = torch.optim.Adam(
+            voxel_model.appearance_mlp.parameters(),
+            lr=cfg.optimizer.decoder_lr,
+            betas=(cfg.optimizer.optim_beta1, cfg.optimizer.optim_beta2),
+            eps=cfg.optimizer.optim_eps)
+        decoder_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            decoder_optimizer,
+            milestones=cfg.optimizer.lr_decay_ckpt,
+            gamma=cfg.optimizer.lr_decay_mult)
+
     if loaded_iter is not None and args.load_optimizer:
         optim_path = os.path.join(source_model_path, "optim.pt")
         if os.path.exists(optim_path):
             optim_ckpt = torch.load(optim_path)
             optimizer.load_state_dict(optim_ckpt['optim'])
             scheduler.load_state_dict(optim_ckpt['sched'])
+            if 'decoder_optim' in optim_ckpt and decoder_optimizer is not None:
+                decoder_optimizer.load_state_dict(optim_ckpt['decoder_optim'])
+            if 'decoder_sched' in optim_ckpt and decoder_scheduler is not None:
+                decoder_scheduler.load_state_dict(optim_ckpt['decoder_sched'])
             del optim_ckpt
             print(f"[OPTIM] Loaded optimizer and scheduler from {optim_path}")
         else:
@@ -342,6 +370,8 @@ def training(args):
 
         # Backward to get gradient of current iteration
         optimizer.zero_grad(set_to_none=True)
+        if decoder_optimizer is not None:
+            decoder_optimizer.zero_grad(set_to_none=True)
         if optim_pose is not None:
             optim_pose.zero_grad(set_to_none=True)
         loss.backward()
@@ -354,6 +384,8 @@ def training(args):
 
         # Optimizer step
         optimizer.step()
+        if decoder_optimizer is not None:
+            decoder_optimizer.step()
 
         if optim_pose is not None and iteration > cfg.pose_opt.warmup_pose:
             if iteration % 1000  > 300:
@@ -463,6 +495,8 @@ def training(args):
 
         # Update learning rate
         scheduler.step()
+        if decoder_scheduler is not None:
+            decoder_scheduler.step()
         if sched_pose is not None and iteration > cfg.pose_opt.warmup_pose:
             sched_pose.step()
 
@@ -504,9 +538,12 @@ def training(args):
             if iteration in args.checkpoint_iterations or iteration == cfg.procedure.n_iter:
                 voxel_model.save_iteration(args.model_path, iteration, quantize=args.save_quantized)
                 if args.save_optimizer:
-                    torch.save(
-                        {'optim': optimizer.state_dict(), 'sched': scheduler.state_dict()},
-                        os.path.join(args.model_path, "optim.pt"))
+                    save_dict = {'optim': optimizer.state_dict(), 'sched': scheduler.state_dict()}
+                    if decoder_optimizer is not None:
+                        save_dict['decoder_optim'] = decoder_optimizer.state_dict()
+                    if decoder_scheduler is not None:
+                        save_dict['decoder_sched'] = decoder_scheduler.state_dict()
+                    torch.save(save_dict, os.path.join(args.model_path, "optim.pt"))
                 if cfg.pose_opt.pose_opt and pose_optimizer is not None:
                     pose_ckpt = {
                         'poses': pose_optimizer.state_dict_poses(),
@@ -1018,7 +1055,8 @@ if __name__ == "__main__":
         description="Sparse voxels raster optimization."
         "You can specify a list of config files to overwrite the default setups."
         "All config fields can also be overwritten by command line.")
-    parser.add_argument('--model_path')
+    parser.add_argument('-m', '--model_path', default=None)
+    parser.add_argument('-s', '--source_path', default=None)
     parser.add_argument('--cfg_files', default=[], nargs='*')
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="*", type=int, default=[-1])
@@ -1037,19 +1075,40 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_pose", type=int, default=None, help="Warmup iterations before pose optimization")
     parser.add_argument("--pose_epoch_interval", type=int, default=None, help="Epoch interval to record metrics")
     parser.add_argument("--fast_10k", "--10k", action="store_true", default=False, help="Shift and scale the entire 20000-step training logic to 10000 steps.")
-    parser.add_argument("--n_iter", "--iter", type=int, default=None, help="Set total iterations (e.g. 10000) and scale schedules proportionally.")
+    parser.add_argument("--n_iter", "--iter", type=int, default=None, help="Set total iterations (e.g. 100). Does not scale schedules unless --scale_schedule is passed.")
+    parser.add_argument("--scale_schedule", action="store_true", default=False, help="Explicitly enable proportional schedule scaling when setting --n_iter.")
     parser.add_argument("--sche_mult", type=float, default=None, help="Schedule multiplier factor (e.g. 0.5 for 10k)")
     parser.add_argument("--keep_lr", action="store_true", default=False, help="Do not scale learning rates when scaling iterations (keeps original LR)")
+    parser.add_argument("--deferred_appearance", action="store_true", default=False, help="Enable deferred neural appearance model")
     args, cmd_lst = parser.parse_known_args()
+
+    # Apply command-line source_path if provided
+    if args.source_path:
+        cfg.data.source_path = args.source_path
+
+    # Auto-detect synthetic NeRF if cfg_files is not specified
+    if not args.cfg_files and cfg.data.source_path:
+        transforms_train = os.path.join(cfg.data.source_path, "transforms_train.json")
+        synthetic_yaml = os.path.join(os.path.dirname(__file__), "cfg", "synthetic_nerf.yaml")
+        if os.path.exists(transforms_train) and os.path.exists(synthetic_yaml):
+            print(f"[AUTO CONFIG] Detected synthetic NeRF dataset at {cfg.data.source_path}. Automatically applying {synthetic_yaml}")
+            args.cfg_files = [synthetic_yaml]
 
     # Update config from files and command line
     update_config(args.cfg_files, cmd_lst)
+    if args.deferred_appearance:
+        cfg.model.deferred_appearance = True
+    if args.n_iter is not None:
+        cfg.procedure.n_iter = args.n_iter
+
     if args.fast_10k:
         cfg.procedure.sche_mult = 0.5
     elif args.sche_mult is not None:
         cfg.procedure.sche_mult = args.sche_mult
-    elif args.n_iter is not None:
+    elif args.scale_schedule and args.n_iter is not None:
         cfg.procedure.sche_mult = float(args.n_iter) / 20000.0
+    else:
+        cfg.procedure.sche_mult = 1.0
 
     if args.pose_opt:
         cfg.pose_opt.pose_opt = True
@@ -1081,8 +1140,9 @@ if __name__ == "__main__":
         sche_mult = cfg.procedure.sche_mult
 
         if not args.keep_lr:
-            for key in ['geo_lr', 'sh0_lr', 'shs_lr']:
-                cfg.optimizer[key] /= sche_mult
+            for key in ['geo_lr', 'sh0_lr', 'shs_lr', 'feat_lr', 'decoder_lr']:
+                if key in cfg.optimizer:
+                    cfg.optimizer[key] /= sche_mult
 
         cfg.optimizer.lr_decay_ckpt = [
             round(v * sche_mult) if v > 0 else v

@@ -17,7 +17,7 @@ namespace BACKWARD
 {
 
 // Interface for python to run backward pass of voxel rasterization.
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels_backward(
     const int R,
     const int n_samp_per_vox,
@@ -33,6 +33,7 @@ rasterize_voxels_backward(
     const torch::Tensor& vox_lengths,
     const torch::Tensor& geos,
     const torch::Tensor& rgbs,
+    const torch::Tensor& feats,
 
     const torch::Tensor& geomBuffer,
     const torch::Tensor& binningBuffer,
@@ -40,6 +41,7 @@ rasterize_voxels_backward(
     const torch::Tensor& out_T,
 
     const torch::Tensor& dL_dout_color,
+    const torch::Tensor& dL_dout_feat,
     const torch::Tensor& dL_dout_depth,
     const torch::Tensor& dL_dout_normal,
     const torch::Tensor& dL_dout_T,

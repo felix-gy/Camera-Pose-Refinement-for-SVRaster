@@ -38,7 +38,7 @@ class SparseAdam(torch.optim.Optimizer):
             eps = group['eps']
 
             for param in group['params']:
-                if param.grad is not None:
+                if param.grad is not None and param.numel() > 0:
                     state = self.state[param]
                     # Lazy state initialization
                     if len(state) == 0:

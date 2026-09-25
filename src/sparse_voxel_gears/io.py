@@ -31,6 +31,14 @@ class SVInOut:
             '_shs': self._shs.data.contiguous(),
         }
 
+        if getattr(self, 'deferred_appearance', False):
+            state_dict['deferred_appearance'] = True
+            state_dict['appearance_feat_dim'] = getattr(self, 'appearance_feat_dim', 8)
+            if hasattr(self, '_feat_grid_pts') and self._feat_grid_pts is not None:
+                state_dict['_feat_grid_pts'] = self._feat_grid_pts.data.contiguous()
+            if hasattr(self, 'appearance_mlp') and self.appearance_mlp is not None:
+                state_dict['appearance_mlp'] = self.appearance_mlp.state_dict()
+
         if quantize:
             quantize_state_dict(state_dict)
             state_dict['quantized'] = True
@@ -65,6 +73,20 @@ class SVInOut:
         self._geo_grid_pts = state_dict['_geo_grid_pts'].cuda().requires_grad_()
         self._sh0 = state_dict['_sh0'].cuda().requires_grad_()
         self._shs = state_dict['_shs'].cuda().requires_grad_()
+
+        if state_dict.get('deferred_appearance', False) or '_feat_grid_pts' in state_dict:
+            self.deferred_appearance = True
+            self.appearance_feat_dim = state_dict.get('appearance_feat_dim', 8)
+            if '_feat_grid_pts' in state_dict:
+                self._feat_grid_pts = state_dict['_feat_grid_pts'].cuda().requires_grad_()
+            if 'appearance_mlp' in state_dict:
+                if not hasattr(self, 'appearance_mlp') or self.appearance_mlp is None:
+                    from src.models.deferred_appearance import DeferredAppearanceMLP
+                    self.appearance_mlp = DeferredAppearanceMLP(
+                        feat_dim=self.appearance_feat_dim,
+                        hidden_dim=getattr(self, 'appearance_hidden_dim', 32)
+                    ).cuda()
+                self.appearance_mlp.load_state_dict(state_dict['appearance_mlp'])
 
         # Subdivision priority trackor
         self._subdiv_p = torch.ones(

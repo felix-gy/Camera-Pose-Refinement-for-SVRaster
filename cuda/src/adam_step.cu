@@ -113,6 +113,8 @@ void unbiased_adam_step(
 	const double lr, const double beta1, const double beta2, const float eps)
 {
 	const int numel = param.numel();
+	if (numel == 0)
+		return;
 
 	const double bias_correction1 = 1.0 - pow(beta1, step);
 	const double bias_correction2 = 1.0 - pow(beta2, step);
@@ -143,6 +145,8 @@ void biased_adam_step(
 	const float lr, const float beta1, const float beta2, const float eps)
 {
 	const int numel = param.numel();
+	if (numel == 0)
+		return;
 
 	auto kernel_func = sparse ? biased_adam_step_cuda_kernel<true> :
 								biased_adam_step_cuda_kernel<false>;

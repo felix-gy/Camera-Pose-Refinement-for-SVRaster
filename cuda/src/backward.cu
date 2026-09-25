@@ -49,12 +49,14 @@ renderCUDA(
     const float* __restrict__ vox_lengths,
     const float* __restrict__ geos,
     const float3* __restrict__ rgbs,
+    const float* __restrict__ feats,
 
     const float* __restrict__ out_T,
     const uint32_t* __restrict__ tile_last,
     const uint32_t* __restrict__ n_contrib,
 
     const float* __restrict__ dL_dout_color,
+    const float* __restrict__ dL_dout_feat,
     const float* __restrict__ dL_dout_depth,
     const float* __restrict__ dL_dout_normal,
     const float* __restrict__ dL_dout_T,
@@ -67,6 +69,7 @@ renderCUDA(
     const float* out_N,
 
     float* dL_dvox,
+    float* dL_dfeats,
     float* __restrict__ dL_dc2w)
 {
     // We rasterize again. Compute necessary block info.
@@ -162,6 +165,7 @@ renderCUDA(
 
     // Init gradient from the last computation node.
     float3 dL_dpix;
+    float dL_dfeat_pix[8] = {0.f};
     float dL_dD;
     float3 dL_dN;
     float last_dL_dT;
@@ -170,6 +174,12 @@ renderCUDA(
         dL_dpix.x = dL_dout_color[0 * H * W + pix_id];
         dL_dpix.y = dL_dout_color[1 * H * W + pix_id];
         dL_dpix.z = dL_dout_color[2 * H * W + pix_id];
+        if (dL_dout_feat != nullptr)
+        {
+            #pragma unroll
+            for (int c = 0; c < 8; ++c)
+                dL_dfeat_pix[c] = dL_dout_feat[c * H * W + pix_id];
+        }
         const float dL_dpix_T = dL_dout_T[pix_id];
         last_dL_dT = dL_dpix_T + bg_color * (dL_dpix.x + dL_dpix.y + dL_dpix.z);
 
@@ -347,6 +357,39 @@ renderCUDA(
 
             // The gradients w.r.t. voxel alpha.
             float dL_dpt_w = dot(dL_dpix, c);
+
+            if (feats != nullptr && dL_dout_feat != nullptr)
+            {
+                const float* v_feats = feats + vox_id * 64;
+                float dot_feat = 0.f;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c)
+                {
+                    float s_feat = 0.f;
+                    #pragma unroll
+                    for (int corner = 0; corner < 8; ++corner)
+                    {
+                        s_feat += interp_w[corner] * v_feats[corner * 8 + c];
+                    }
+                    dot_feat += dL_dfeat_pix[c] * s_feat;
+                }
+                dL_dpt_w += dot_feat;
+
+                if (dL_dfeats != nullptr)
+                {
+                    float* vox_dL_dfeats = dL_dfeats + vox_id * 64;
+                    #pragma unroll
+                    for (int corner = 0; corner < 8; ++corner)
+                    {
+                        float w_phi = pt_w * interp_w[corner];
+                        #pragma unroll
+                        for (int c = 0; c < 8; ++c)
+                        {
+                            atomicAdd(vox_dL_dfeats + corner * 8 + c, w_phi * dL_dfeat_pix[c]);
+                        }
+                    }
+                }
+            }
 
             // Gradient from distortion loss
             if (need_distortion)
@@ -661,12 +704,14 @@ void render(
     const float* vox_lengths,
     const float* geos,
     const float3* rgbs,
+    const float* feats,
 
     const float* out_T,
     const uint32_t* tile_last,
     const uint32_t* n_contrib,
 
     const float* dL_dout_color,
+    const float* dL_dout_feat,
     const float* dL_dout_depth,
     const float* dL_dout_normal,
     const float* dL_dout_T,
@@ -681,6 +726,7 @@ void render(
     const float* out_N,
 
     float* dL_dvox,
+    float* dL_dfeats,
     float* dL_dc2w)
 {
     const bool need_distortion = (lambda_dist > 0);
@@ -707,12 +753,14 @@ void render(
         vox_lengths,
         geos,
         rgbs,
+        feats,
 
         out_T,
         tile_last,
         n_contrib,
 
         dL_dout_color,
+        dL_dout_feat,
         dL_dout_depth,
         dL_dout_normal,
         dL_dout_T,
@@ -725,12 +773,13 @@ void render(
         out_N,
 
         dL_dvox,
+        dL_dfeats,
         dL_dc2w);
 }
 
 
 // Interface for python to run backward pass of voxel rasterization.
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels_backward(
     const int R,
     const int n_samp_per_vox,
@@ -746,6 +795,7 @@ rasterize_voxels_backward(
     const torch::Tensor& vox_lengths,
     const torch::Tensor& geos,
     const torch::Tensor& rgbs,
+    const torch::Tensor& feats,
 
     const torch::Tensor& geomBuffer,
     const torch::Tensor& binningBuffer,
@@ -753,6 +803,7 @@ rasterize_voxels_backward(
     const torch::Tensor& out_T,
 
     const torch::Tensor& dL_dout_color,
+    const torch::Tensor& dL_dout_feat,
     const torch::Tensor& dL_dout_depth,
     const torch::Tensor& dL_dout_normal,
     const torch::Tensor& dL_dout_T,
@@ -777,13 +828,21 @@ rasterize_voxels_backward(
     {
         torch::Tensor dL_dgeos = torch::empty({0});
         torch::Tensor dL_drgbs = torch::empty({0});
+        torch::Tensor dL_dfeats = torch::empty({0});
         torch::Tensor subdiv_p_bw = torch::empty({0});
         torch::Tensor dL_dc2w = torch::zeros({4, 4}, vox_centers.options());
-        return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw, dL_dc2w);
+        return std::make_tuple(dL_dgeos, dL_drgbs, dL_dfeats, subdiv_p_bw, dL_dc2w);
     }
 
     torch::Tensor dL_dvox = torch::zeros({P, geos.size(1)+3+1}, vox_centers.options());
     torch::Tensor dL_dc2w = torch::zeros({4, 4}, vox_centers.options());
+
+    const bool need_feat = (feats.defined() && feats.numel() > 0 && dL_dout_feat.defined() && dL_dout_feat.numel() > 0);
+    torch::Tensor dL_dfeats = need_feat ? torch::zeros({P, 8, 8}, vox_centers.options()) : torch::empty({0}, vox_centers.options());
+    const float* feats_ptr = need_feat ? feats.contiguous().data_ptr<float>() : nullptr;
+    const float* dL_dout_feat_ptr = need_feat ? dL_dout_feat.contiguous().data_ptr<float>() : nullptr;
+    float* dL_dfeats_ptr = need_feat ? dL_dfeats.contiguous().data_ptr<float>() : nullptr;
+
     dim3 tile_grid((image_width + BLOCK_X - 1) / BLOCK_X, (image_height + BLOCK_Y - 1) / BLOCK_Y, 1);
     dim3 block(BLOCK_X, BLOCK_Y, 1);
 
@@ -819,12 +878,14 @@ rasterize_voxels_backward(
         vox_lengths.contiguous().data_ptr<float>(),
         geos.contiguous().data_ptr<float>(),
         (float3*)(rgbs.contiguous().data_ptr<float>()),
+        feats_ptr,
 
         out_T.contiguous().data_ptr<float>(),
         imgState.tile_last,
         imgState.n_contrib,
 
         dL_dout_color.contiguous().data_ptr<float>(),
+        dL_dout_feat_ptr,
         dL_dout_depth.contiguous().data_ptr<float>(),
         dL_dout_normal.contiguous().data_ptr<float>(),
         dL_dout_T.contiguous().data_ptr<float>(),
@@ -839,6 +900,7 @@ rasterize_voxels_backward(
         out_N.contiguous().data_ptr<float>(),
 
         dL_dvox.contiguous().data_ptr<float>(),
+        dL_dfeats_ptr,
         dL_dc2w.contiguous().data_ptr<float>());
     CHECK_CUDA(debug);
 
@@ -847,7 +909,7 @@ rasterize_voxels_backward(
     torch::Tensor dL_drgbs = gradient_lst[1].contiguous();
     torch::Tensor subdiv_p_bw = gradient_lst[2].contiguous();
 
-    return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw, dL_dc2w);
+    return std::make_tuple(dL_dgeos, dL_drgbs, dL_dfeats, subdiv_p_bw, dL_dc2w);
 }
 
 }

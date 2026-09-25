@@ -58,6 +58,9 @@ class SVRasterViewer:
             ss=cfg.model.ss,
             white_background=cfg.model.white_background,
             black_background=cfg.model.black_background,
+            deferred_appearance=cfg.model.deferred_appearance,
+            appearance_feat_dim=cfg.model.appearance_feat_dim,
+            appearance_hidden_dim=cfg.model.appearance_hidden_dim,
         )
         self.voxel_model.load_iteration(args.model_path, args.iteration)
         self.voxel_model.freeze_vox_geo()
@@ -74,14 +77,24 @@ class SVRasterViewer:
         ''')
         self.fps = self.server.gui.add_text("Rending FPS", initial_value="-1", disabled=True)
 
+        is_deferred = getattr(self.voxel_model, 'deferred_appearance', False)
+
         # Create gui for setup viewer
         self.active_sh_degree_slider = self.server.gui.add_slider(
-            "active_sh_degree",
+            "active_sh_degree" + (" (SH0 only)" if is_deferred else ""),
             min=0,
-            max=self.voxel_model.max_sh_degree,
+            max=max(1, self.voxel_model.max_sh_degree),
             step=1,
             initial_value=self.voxel_model.active_sh_degree,
+            disabled=is_deferred or (self.voxel_model.max_sh_degree == 0),
         )
+
+        if is_deferred:
+            self.appearance_mode_dropdown = self.server.gui.add_dropdown(
+                "neural appearance",
+                options=["base + residual", "base only (SH0)", "residual only"],
+                initial_value="base + residual",
+            )
 
         self.ss_slider = self.server.gui.add_slider(
             "ss",
@@ -264,7 +277,16 @@ class SVRasterViewer:
         elif self.output_dropdown.value == "alpha":
             im = im_tensor2np(1 - render_pkg["T"].repeat(3, 1, 1))
         else:
-            im = im_tensor2np(render_pkg["color"])
+            if getattr(self.voxel_model, 'deferred_appearance', False) and hasattr(self, 'appearance_mode_dropdown'):
+                if self.appearance_mode_dropdown.value == "base only (SH0)":
+                    im = im_tensor2np(render_pkg.get('base_color', render_pkg['color']))
+                elif self.appearance_mode_dropdown.value == "residual only" and render_pkg.get('residual') is not None:
+                    # Map [-1, 1] to [0, 1] for visualization
+                    im = im_tensor2np(render_pkg['residual'] * 0.5 + 0.5)
+                else:
+                    im = im_tensor2np(render_pkg["color"])
+            else:
+                im = im_tensor2np(render_pkg["color"])
         del render_pkg
 
         return im, eps

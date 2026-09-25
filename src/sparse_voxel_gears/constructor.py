@@ -25,6 +25,8 @@ class SVConstructor:
                    sh0_init=0.5,       # Init voxel colors in range [0,1]
                    shs_init=0.0,       # Init coefficients of higher-degree sh
                    cameras=None,       # Cameras that helps voxel allocation
+                   appearance_feat_dim=8, # Latent feature dimension per grid point
+                   appearance_feat_std=0.01, # Std for appearance feature initialization
                    ):
 
         assert outside_level <= svraster_cuda.meta.MAX_NUM_LEVELS
@@ -72,6 +74,13 @@ class SVConstructor:
             [self.num_grid_pts, 1], geo_init,
             dtype=torch.float32, device="cuda").requires_grad_()
 
+        if getattr(self, 'deferred_appearance', False):
+            self.appearance_feat_dim = appearance_feat_dim
+            self._feat_grid_pts = torch.empty(
+                [self.num_grid_pts, self.appearance_feat_dim],
+                dtype=torch.float32, device="cuda"
+            ).normal_(0.0, appearance_feat_std).requires_grad_()
+
         self._sh0 = torch.full(
             [self.num_voxels, 3], rgb2shzero(sh0_init),
             dtype=torch.float32, device="cuda").requires_grad_()
@@ -84,6 +93,7 @@ class SVConstructor:
         self._subdiv_p = torch.ones(
             [self.num_voxels, 1],
             dtype=torch.float32, device="cuda").requires_grad_()
+
 
     def octpath_init(self,
                   scene_center,
@@ -99,6 +109,7 @@ class SVConstructor:
                   density=-10.,  # Nx8 or Ngridx1 or scalar for voxel density field.
                                  # The order is [0,0,0] => [0,0,1] => [0,1,0] => [0,1,1] ...
                   reduce_density=False,  # Whether to merge grid points if density is Nx8.
+                  features=None,         # Latent features for deferred neural appearance
                   ):
 
         self.scene_center, self.scene_extent, self.inside_extent = get_scene_bound_tensor(
@@ -107,9 +118,11 @@ class SVConstructor:
         assert torch.is_tensor(octpath)
         octlevel = get_octlevel_tensor(octlevel, num_voxels=len(octpath))
 
-        self.octpath = octpath.view(-1, 1).contiguous()
-        self.octlevel = octlevel.view(-1, 1).contiguous()
-        assert len(self.octpath) == len(self.octlevel)
+        assert len(octpath.shape) == 2 and octpath.shape[1] == 1
+        assert len(octlevel.shape) == 2 and octlevel.shape[1] == 1
+        assert len(octpath) == len(octlevel)
+        self.octpath = octpath.contiguous().cuda()
+        self.octlevel = octlevel.contiguous().cuda().to(torch.int8)
 
         # Subdivision priority trackor
         self._subdiv_p = torch.ones(
@@ -156,6 +169,16 @@ class SVConstructor:
             self._geo_grid_pts = torch.full(
                 [self.num_grid_pts, 1], density,
                 dtype=torch.float32, device="cuda").requires_grad_()
+
+        # Setup appearance features
+        if torch.is_tensor(features):
+            self._feat_grid_pts = features.contiguous().cuda().requires_grad_()
+        elif getattr(self, 'deferred_appearance', False):
+            feat_dim = getattr(self, 'appearance_feat_dim', 8)
+            self._feat_grid_pts = torch.empty(
+                [self.num_grid_pts, feat_dim],
+                dtype=torch.float32, device="cuda"
+            ).normal_(0.0, 0.01).requires_grad_()
 
     def ijkl_init(self,
                   scene_center,

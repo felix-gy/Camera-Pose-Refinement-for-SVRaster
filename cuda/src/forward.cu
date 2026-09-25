@@ -53,11 +53,13 @@ renderCUDA(
     const float* __restrict__ vox_lengths,
     const float* __restrict__ geos,
     const float3* __restrict__ rgbs,
+    const float* __restrict__ feats,
 
     uint32_t* __restrict__ tile_last,
     uint32_t* __restrict__ n_contrib,
 
     float* __restrict__ out_color,
+    float* __restrict__ out_feat,
     float* __restrict__ out_depth,
     float* __restrict__ out_normal,
     float* __restrict__ out_T,
@@ -142,6 +144,7 @@ renderCUDA(
     uint32_t contributor = 0;
     uint32_t last_contributor = 0;
     float3 C = {0.f, 0.f, 0.f};
+    float F[8] = {0.f};
     float3 N = {0.f, 0.f, 0.f};
     float D = 0.f;
     int D_med_vox_id = -1;
@@ -255,6 +258,22 @@ renderCUDA(
             // Accumulate to the pixel.
             float pt_w = T * alpha;
             C = C + pt_w * collected_rgb[j];
+
+            if (feats != nullptr)
+            {
+                const float* v_feats = feats + vox_id * 64;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c)
+                {
+                    float s_feat = 0.f;
+                    #pragma unroll
+                    for (int corner = 0; corner < 8; ++corner)
+                    {
+                        s_feat += interp_w[corner] * v_feats[corner * 8 + c];
+                    }
+                    F[c] += pt_w * s_feat;
+                }
+            }
 
             if (need_depth)
             {
@@ -371,6 +390,12 @@ renderCUDA(
         out_color[0 * H * W + pix_id] = C.x + T * bg_color;
         out_color[1 * H * W + pix_id] = C.y + T * bg_color;
         out_color[2 * H * W + pix_id] = C.z + T * bg_color;
+        if (out_feat != nullptr)
+        {
+            #pragma unroll
+            for (int c = 0; c < 8; ++c)
+                out_feat[c * H * W + pix_id] = F[c];
+        }
         out_T[pix_id] = T;  // Equal to (1 - alpha).
         if (need_depth)
         {
@@ -451,11 +476,13 @@ void render(
     const float* vox_lengths,
     const float* geos,
     const float3* rgbs,
+    const float* feats,
 
     uint32_t* tile_last,
     uint32_t* n_contrib,
 
     float* out_color,
+    float* out_feat,
     float* out_depth,
     float* out_normal,
     float* out_T,
@@ -484,11 +511,13 @@ void render(
         vox_lengths,
         geos,
         rgbs,
+        feats,
 
         tile_last,
         n_contrib,
 
         out_color,
+        out_feat,
         out_depth,
         out_normal,
         out_T,
@@ -619,8 +648,10 @@ int rasterize_voxels_procedure(
     const float* vox_lengths,
     const float* geos,
     const float* rgbs,
+    const float* feats,
 
     float* out_color,
+    float* out_feat,
     float* out_depth,
     float* out_normal,
     float* out_T,
@@ -719,11 +750,13 @@ int rasterize_voxels_procedure(
         vox_lengths,
         geos,
         (float3*)rgbs,
+        feats,
 
         imgState.tile_last,
         imgState.n_contrib,
 
         out_color,
+        out_feat,
         out_depth,
         out_normal,
         out_T,
@@ -735,7 +768,7 @@ int rasterize_voxels_procedure(
 
 
 // Interface for python to run forward rasterization.
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels(
     const int n_samp_per_vox,
     const int image_width, const int image_height,
@@ -754,6 +787,7 @@ rasterize_voxels(
     const torch::Tensor& vox_lengths,
     const torch::Tensor& geos,
     const torch::Tensor& rgbs,
+    const torch::Tensor& feats,
 
     const torch::Tensor& geomBuffer,
 
@@ -773,11 +807,16 @@ rasterize_voxels(
     auto float_opts = torch::TensorOptions(torch::kFloat32).device(torch::kCUDA);
     auto byte_opts = torch::TensorOptions(torch::kByte).device(torch::kCUDA);
 
+    const bool need_feat = (feats.defined() && feats.numel() > 0);
     torch::Tensor out_color = torch::full({3, H, W}, 0.f, float_opts);
+    torch::Tensor out_feat = need_feat ? torch::full({8, H, W}, 0.f, float_opts) : torch::empty({0}, float_opts);
     torch::Tensor out_depth = need_depth || need_distortion ? torch::full({3, H, W}, 0.f, float_opts) : torch::empty({0});
     torch::Tensor out_normal = need_normal ? torch::full({3, H, W}, 0.f, float_opts) : torch::empty({0});
     torch::Tensor out_T = torch::full({1, H, W}, 0.f, float_opts);
     torch::Tensor max_w = track_max_w ? torch::full({P, 1}, 0.f, float_opts) : torch::empty({0});
+
+    const float* feats_pointer = need_feat ? feats.contiguous().data_ptr<float>() : nullptr;
+    float* out_feat_pointer = need_feat ? out_feat.contiguous().data_ptr<float>() : nullptr;
 
     torch::Tensor binningBuffer = torch::empty({0}, byte_opts);
     torch::Tensor imgBuffer = torch::empty({0}, byte_opts);
@@ -812,8 +851,10 @@ rasterize_voxels(
             vox_lengths.contiguous().data_ptr<float>(),
             geos.contiguous().data_ptr<float>(),
             rgbs.contiguous().data_ptr<float>(),
+            feats_pointer,
 
             out_color.contiguous().data_ptr<float>(),
+            out_feat_pointer,
             out_depth.contiguous().data_ptr<float>(),
             out_normal.contiguous().data_ptr<float>(),
             out_T.contiguous().data_ptr<float>(),
@@ -821,7 +862,7 @@ rasterize_voxels(
 
             debug);
 
-    return std::make_tuple(rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w);
+    return std::make_tuple(rendered, binningBuffer, imgBuffer, out_color, out_feat, out_depth, out_normal, out_T, max_w);
 }
 
 }

@@ -16,7 +16,7 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 namespace FORWARD {
 
 // Interface for python to run forward rasterization.
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels(
     const int n_samp_per_vox,
     const int image_width, const int image_height,
@@ -35,6 +35,7 @@ rasterize_voxels(
     const torch::Tensor& vox_lengths,
     const torch::Tensor& geos,
     const torch::Tensor& rgbs,
+    const torch::Tensor& feats,
 
     const torch::Tensor& geomBuffer,
 
